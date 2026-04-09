@@ -1,0 +1,21 @@
+# インストール: pip install -r requirements.txt
+# 起動: プロジェクト直下で python run.py <command>（一覧は python run.py のみ）
+
+# 類似画像・PDF/AVIF
+Pillow>=10.0.0
+imagehash>=4.3.1
+send2trash>=1.8.0
+pybktree>=1.1
+pillow-avif-plugin>=1.4.0
+
+# 最適化スクリプト
+rarfile>=4.0
+py7zr>=0.20.0
+psutil>=5.9.0
+tqdm>=4.65.0
+
+# YouTube
+yt-dlp>=2024.1.0
+
+# PDF → AVIF
+PyMuPDF>=1.23.0

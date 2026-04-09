@@ -1,7 +1,6 @@
 {
     "TARGET_DIRS": [
-        "E:\\gaz 画像",
-        "E:\\dow Download\\sns_media_download\\SNS画像"
+        "E:\\gaz 画像"
     ],
     "EXCLUDE_DIR_NAMES": [
         "お気に入り",
