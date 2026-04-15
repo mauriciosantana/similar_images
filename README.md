@@ -28,7 +28,7 @@ python -m image_tools <command> ...
 - **`project_settings.json`（必須・パス系コマンド）**  
   リポジトリ内の既定パスは **未設定（None）** です。`sns` / `inject` / `teketou` / `youtube` / `pdf2avif` などは、プロジェクト直下に `project_settings.json` を置き、サンプル `config/project_settings.example.json` を参考に各パスを書いてください。  
   `optimizer` はルートディレクトリを引数で渡すため必須ではありません。ExifTool を使う場合のみ `EXIFTOOL_PATH` を設定します。  
-  `count-jpg` は `--prefix` を付ければ `BASE_SAVE_DIR` なしでも動きます。
+  `count` は `--prefix` を付ければ `BASE_SAVE_DIR` なしでも動きます。
 - 類似画像用は `config.json`（初回実行で自動生成される場合あり）
 
 ## optimizer と類似画像キャッシュ（DB）

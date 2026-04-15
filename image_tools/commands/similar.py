@@ -26,11 +26,15 @@ import imagehash
 from send2trash import send2trash
 import pybktree
 import concurrent.futures
+from tqdm import tqdm
 
 try:
     import pillow_avif
 except ImportError:
     pass # AVIF非対応環境でも動くようにフォールバック
+
+import sys
+from pathlib import Path
 
 # ==========================================
 # 初期設定・準備
@@ -280,7 +284,7 @@ def compute_image_info(args_tuple):
             aspect_ratio = orig_w / orig_h if orig_h > 0 else 0
             
             img.draft("RGB", (THUMB_SIZE, THUMB_SIZE))
-            # 【追加】パレットモードで透過情報を持つ場合はRGBAに変換して警告を回避
+            # パレットモードで透過情報を持つ場合はRGBAに変換して警告を回避
             if img.mode == 'P' and 'transparency' in img.info:
                 img = img.convert('RGBA')
 
@@ -350,7 +354,8 @@ class SimilarImageApp(tk.Tk):
         self.status_label = ttk.Label(self.bottom_frame, text="", font=("Meiryo", 12, "bold"), foreground="blue")
         self.status_label.pack(side=tk.TOP, pady=2)
 
-        self.guide_label = ttk.Label(self.bottom_frame, text="【入力例】p 保存 / a 全て残す / d 全て削除 / b 戻る / s 途中保存 / q 終了 / Enter (1番を残す)", font=("Meiryo", 11))
+        # 案内テキストを変更
+        self.guide_label = ttk.Label(self.bottom_frame, text="【入力例】o 1番変換 / oa 全変換 / p 保存 / a 全残す / d 全削除 / b 戻る / s 途中保存 / q 終了 / Enter (1番残す)", font=("Meiryo", 11))
         self.guide_label.pack(side=tk.TOP, pady=2)
 
         self.entry_var = tk.StringVar()
@@ -360,10 +365,7 @@ class SimilarImageApp(tk.Tk):
         self.cmd_entry.pack(side=tk.TOP, pady=10)
         self.entry_var.trace_add("write", self._on_entry_write)
 
-        # 修正1: <Return>をcmd_entryだけでなく、ウィンドウ全体(bind_all)で受け付けるようにする
         self.bind_all("<Return>", self.on_enter)
-        
-        # 修正2: 画面のどこをクリックしても強制的に入力ボックスへフォーカスを戻す
         self.bind_all("<Button-1>", lambda e: self.cmd_entry.focus_set())
         
         self.cmd_entry.focus_set()
@@ -531,6 +533,33 @@ class SimilarImageApp(tk.Tk):
                 self.show_current_group()
             return
 
+        # o コマンド (最適化) の処理
+        if ans.startswith('o'):
+            body = ans[1:].strip()
+            indices = []
+            
+            if not body:
+                # 'o' 単体なら 1番の画像（インデックス0）のみを対象
+                if self.current_filtered_infos:
+                    indices = [0]
+            elif body == 'a':
+                # 'oa' なら現在表示中のすべてを対象
+                indices = list(range(len(self.current_filtered_infos)))
+            else:
+                try:
+                    for part in body.split():
+                        idx = int(part) - 1
+                        if 0 <= idx < len(self.current_filtered_infos):
+                            indices.append(idx)
+                except ValueError:
+                    self.last_action_msg = "⚠️ 'o' の後の指定が不正です (例: o, oa, o 1 2)"
+                    self.entry_var.set("")
+                    self.show_current_group()
+                    return
+            
+            self.optimize_selected_images(indices)
+            return
+
         cmd = normalize_selection_command(ans)
         file_names = [Path(self.current_filtered_infos[i]["path"]).name for i in range(len(self.current_filtered_infos))]
         result = compute_selection_indices(cmd, file_names)
@@ -552,6 +581,76 @@ class SimilarImageApp(tk.Tk):
         self._record_action(self.current_idx, current_trash, current_protect, current_at)
         self.history_stack.append(self.current_idx)
         self.current_idx += 1
+        self.show_current_group()
+
+    def optimize_selected_images(self, indices):
+        """選択された画像を optimizer.py で変換・最適化し、DBとUIを更新する"""
+        if not indices:
+            return
+
+        print(f"\n🔄 選択された {len(indices)} 枚の画像を optimizer.py で最適化しています...")
+        self.status_label.config(text="⏳ 画像を変換・最適化しています... しばらくお待ちください")
+        self.update() # GUIを強制アップデートして待機表示を出す
+
+        success_count = 0
+        saved_total = 0
+        # インポートをメソッド内で行い、子プロセス起動時のオーバーヘッドと競合を避ける
+        import image_tools.commands.optimizer as optimizer
+        config = load_config()
+
+        for idx in indices:
+            info = self.current_filtered_infos[idx]
+            old_path_str = info["path"]
+            old_path = Path(old_path_str)
+
+            try:
+                success, saved, new_path, orig_path = optimizer.process_single_image(old_path, as_grayscale=False)
+                
+                if success and new_path:
+                    with Image.open(new_path) as test_img:
+                        test_img.load()
+                    
+                    new_path_str = str(new_path.resolve())
+                    orig_path_str = str(orig_path.resolve())
+
+                    if new_path_str != orig_path_str:
+                        send2trash(orig_path_str)
+                        
+                    _, res = compute_image_info((new_path_str, config["SOLID_TOLERANCE"]))
+                    if res:
+                        res_path, hash_str, color_hash_str, pixels, filesize, aspect_ratio, mtime = res
+                        
+                        # DB更新
+                        if new_path_str != old_path_str:
+                            self.c.execute("DELETE FROM images WHERE path = ?", (old_path_str,))
+                            self.c.execute("UPDATE similarity_edges SET path1 = ? WHERE path1 = ?", (new_path_str, old_path_str))
+                            self.c.execute("UPDATE similarity_edges SET path2 = ? WHERE path2 = ?", (new_path_str, old_path_str))
+                            
+                        self.c.execute(SQL_INSERT_OR_REPLACE_IMAGE, (*res, 1))
+                        self.conn.commit()
+
+                        # メモリ内の辞書を直接更新
+                        info['path'] = new_path_str
+                        info['hash_str'] = hash_str
+                        info['color_hash_str'] = color_hash_str
+                        info['pixels'] = pixels
+                        info['filesize'] = filesize
+                        info['aspect_ratio'] = aspect_ratio
+                        
+                        success_count += 1
+                        saved_total += saved
+                    else:
+                        print(f"  ⚠️ {new_path.name} の再解析に失敗しました")
+
+            except Exception as e:
+                print(f"  ⚠️ {old_path.name} の最適化処理でエラー: {e}")
+
+        if success_count > 0:
+            self.last_action_msg = f"✨ {success_count}枚を最適化し、合計 {format_size(saved_total)} の容量を削減しました！"
+        else:
+            self.last_action_msg = "⚠️ 最適化しましたが、元の画像より容量が減らなかったか、エラーになりました。"
+
+        self.entry_var.set("")
         self.show_current_group()
 
     def apply_pending_actions(self):
@@ -576,7 +675,6 @@ class SimilarImageApp(tk.Tk):
                     if new_stem != old_path.stem:
                         new_path = old_path.with_name(f"{new_stem}{old_path.suffix}")
                         if not self.args.dry_run:
-                            # 変更後
                             try:
                                 old_path.rename(new_path)
                                 new_p_str = str(new_path)
@@ -619,9 +717,8 @@ class SimilarImageApp(tk.Tk):
 def scan_and_sync_files(args, config, conn, c, needs_scan, target_dirs_paths, today_str):
     image_infos = []
     
-    # 【変更点】ファイルの存在確認をスキップして高速化
     if not needs_scan:
-        print("⏭️ 本日のデータベース更新は完了しているため、ファイルスキャンをスキップします。")
+        print("⏭️ ファイルスキャンをスキップし、既存のデータベースから読み込みます（-f で再スキャン可能）。")
         c.execute('SELECT path, hash_str, color_hash_str, pixels, filesize, aspect_ratio FROM images')
         db_rows = c.fetchall()
         print(f"🗄️ データベースから {len(db_rows)} 件の画像情報を読み込み中...")
@@ -630,39 +727,69 @@ def scan_and_sync_files(args, config, conn, c, needs_scan, target_dirs_paths, to
         print("  ✅ 読み込み完了")
         return image_infos
 
-    print(f"🔍 以下のフォルダから画像ファイルを検索中...")
-    target_files = []
-    skipped_files_count = 0
-    full_exclude_dirs = set(config["EXCLUDE_DIR_NAMES"])
-    exclude_keywords = config["EXCLUDE_FILE_KEYWORDS"]
-    
-    for t_dir in target_dirs_paths:
-        if not t_dir.is_dir(): continue
-        for p in t_dir.rglob('*'):
-            if p.is_file() and p.suffix.lower() in SUPPORTED_EXTS:
-                if any(ex in p.parts for ex in full_exclude_dirs) or any(kw in p.name for kw in exclude_keywords):
-                    skipped_files_count += 1
-                    continue
-                if os.access(p, os.W_OK): target_files.append(p)
-                    
-    print(f"  🔍 合計 {len(target_files)} 件の対象ファイルを発見しました。")
-    print(f"🗄️ データベースと実際のファイル状況を同期しています...")
-                
+    print(f"️ データベースと実際のファイル状況を同期しています...")
     c.execute('SELECT path, mtime, filesize, hash_str, color_hash_str, pixels, aspect_ratio FROM images')
     db_cache = {row[0]: row for row in c.fetchall()}
+    db_dir_map = defaultdict(list)
+    for p_str, r in db_cache.items():
+        db_dir_map[str(Path(p_str).parent)].append(r)
+
+    c.execute("SELECT path, mtime FROM folder_mtimes")
+    db_folder_mtimes = dict(c.fetchall())
     
     to_compute = []
     valid_paths = set()
+    new_folder_mtimes = []
+    full_exclude_dirs = set(config["EXCLUDE_DIR_NAMES"])
+    exclude_keywords = config["EXCLUDE_FILE_KEYWORDS"]
     
-    for p in target_files:
-        p_str = str(p)
-        valid_paths.add(p_str)
-        mtime, fsize = os.path.getmtime(p), os.path.getsize(p)
-        if p_str in db_cache and db_cache[p_str][1] == mtime and db_cache[p_str][2] == fsize:
-            r = db_cache[p_str]
-            image_infos.append({'path': p_str, 'hash_str': r[3], 'color_hash_str': r[4], 'pixels': r[5], 'filesize': fsize, 'aspect_ratio': r[6]})
-        else:
-            to_compute.append(p_str)
+    print(f"🔍 画像ファイルを検索中（変更のないサブフォルダはスキップします）...")
+    for t_dir in target_dirs_paths:
+        if not t_dir.is_dir(): continue
+        for root, dirs, files in os.walk(t_dir):
+            # 除外フォルダの設定を反映（dirs[:] を書き換えることで walk が中に入らなくなる）
+            dirs[:] = [d for d in dirs if d not in full_exclude_dirs]
+            
+            root_str = str(Path(root))
+            try:
+                current_mtime = os.path.getmtime(root)
+            except OSError: continue
+
+            if db_folder_mtimes.get(root_str) == current_mtime and root_str in db_dir_map:
+                # フォルダの更新時刻が変わっていない場合は、DBの内容をそのまま信頼して利用
+                for r in db_dir_map[root_str]:
+                    p_str = r[0]
+                    if any(kw in os.path.basename(p_str) for kw in exclude_keywords): continue
+                    valid_paths.add(p_str)
+                    image_infos.append({'path': p_str, 'hash_str': r[3], 'color_hash_str': r[4], 'pixels': r[5], 'filesize': r[2], 'aspect_ratio': r[6]})
+            else:
+                # フォルダが更新されているか未登録の場合は、中のファイルを個別にチェック
+                for f in files:
+                    if Path(f).suffix.lower() not in SUPPORTED_EXTS: continue
+                    if any(kw in f for kw in exclude_keywords): continue
+                    
+                    p = Path(root) / f
+                    p_str = str(p)
+                    try:
+                        stat = p.stat()
+                        mtime, fsize = stat.st_mtime, stat.st_size
+                        if not os.access(p, os.W_OK): continue
+                    except OSError: continue
+
+                    valid_paths.add(p_str)
+                    if p_str in db_cache and db_cache[p_str][1] == mtime and db_cache[p_str][2] == fsize:
+                        r = db_cache[p_str]
+                        image_infos.append({'path': p_str, 'hash_str': r[3], 'color_hash_str': r[4], 'pixels': r[5], 'filesize': fsize, 'aspect_ratio': r[6]})
+                    else:
+                        to_compute.append(p_str)
+                
+                new_folder_mtimes.append((root_str, current_mtime))
+
+    if new_folder_mtimes:
+        c.executemany("INSERT OR REPLACE INTO folder_mtimes VALUES (?, ?)", new_folder_mtimes)
+        conn.commit()
+
+    print(f"  🔍 合計 {len(valid_paths)} 件の対象ファイルを確認しました。")
 
     db_delete = [p_str for p_str in db_cache if p_str not in valid_paths]
     if db_delete: 
@@ -673,10 +800,12 @@ def scan_and_sync_files(args, config, conn, c, needs_scan, target_dirs_paths, to
         print(f"🚀 {len(to_compute)} 個の新規/更新ファイルを解析して保存します...")
         batch = []
         args_list = [(p, config["SOLID_TOLERANCE"]) for p in to_compute]
-        n_workers = min(32, (os.cpu_count() or 1) + 4)
+        n_workers = min(16, os.cpu_count() or 1) # ワーカー数を現実的な範囲に制限
         chunk = max(32, min(256, len(args_list) // (n_workers * 4) or 32))
+        
         with concurrent.futures.ProcessPoolExecutor(max_workers=n_workers) as executor:
-            for path_str, res in executor.map(compute_image_info, args_list, chunksize=chunk):
+            results = executor.map(compute_image_info, args_list, chunksize=chunk)
+            for path_str, res in tqdm(results, total=len(args_list), desc="⏳ 画像解析"):
                 if res:
                     batch.append((*res, 0))
                     image_infos.append({'path': path_str, 'hash_str': res[1], 'color_hash_str': res[2], 'pixels': res[3], 'filesize': res[4], 'aspect_ratio': res[5]})
@@ -687,6 +816,7 @@ def scan_and_sync_files(args, config, conn, c, needs_scan, target_dirs_paths, to
                     c.executemany(SQL_INSERT_OR_REPLACE_IMAGE, batch)
                     conn.commit()
                     batch = []
+            executor.shutdown(wait=True) # 明示的に終了を待機
         if batch:
             c.executemany(SQL_INSERT_OR_REPLACE_IMAGE, batch)
             conn.commit()
@@ -753,7 +883,7 @@ def find_similar_groups(image_infos, args, config, c, conn):
             h_map[hs].append(i)
             
         new_edges = []
-        for i in unchecked_idx:
+        for i in tqdm(unchecked_idx, desc="⏳ 類似判定"):
             info = image_infos[i]
             for _, m_hash in tree.find(phash_obj(info['hash_str']), args.level - 1):
                 for j in h_map[str(m_hash)]:
@@ -791,7 +921,6 @@ def find_similar_groups(image_infos, args, config, c, conn):
         if not all(contains_protect_marker(Path(image_infos[j]["path"]).name) for j in g_idx)
     ]
     
-    # 引数 -s/--sort-size が指定されている場合、グループ内の合計ファイルサイズでソート
     if args.sort_size:
         valid_groups.sort(key=lambda g_idx: sum(image_infos[j]['filesize'] for j in g_idx), reverse=True)
         
@@ -801,7 +930,18 @@ def find_similar_groups(image_infos, args, config, c, conn):
 # ==========================================
 # メインプロセス
 # ==========================================
+def setup_path():
+    """インポートパスの解決"""
+    _current_dir = str(Path(__file__).resolve().parent)
+    if _current_dir not in sys.path:
+        sys.path.insert(0, _current_dir)
+
+import multiprocessing
+if os.name == 'nt':
+    multiprocessing.set_start_method('spawn', force=True)
+
 def main():
+    setup_path()
     parser = argparse.ArgumentParser(description="類似画像整理スクリプト")
     parser.add_argument("-l", "--level", type=int, choices=range(1, 17), default=1)
     parser.add_argument("-c", "--color-level", type=int, default=10)
@@ -824,7 +964,7 @@ def main():
 
     c.execute("SELECT value FROM metadata WHERE key = 'last_scan_date'")
     row = c.fetchone()
-    if not row or row[0] != today_str:
+    if not row:
         needs_scan = True
 
     c.execute(

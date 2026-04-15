@@ -2,7 +2,7 @@
 
 import sqlite3
 
-DELETE_DB_CHUNK = 1000
+DELETE_DB_CHUNK = 512
 
 SQL_INSERT_OR_REPLACE_IMAGE = (
     "INSERT OR REPLACE INTO images VALUES (?,?,?,?,?,?,?,?)"
@@ -30,6 +30,9 @@ def init_db(db_path):
     )
     c.execute(
         """CREATE TABLE IF NOT EXISTS metadata (key TEXT PRIMARY KEY, value TEXT)"""
+    )
+    c.execute(
+        """CREATE TABLE IF NOT EXISTS folder_mtimes (path TEXT PRIMARY KEY, mtime REAL)"""
     )
     c.execute(
         "CREATE INDEX IF NOT EXISTS idx_exact ON images(hash_str, color_hash_str, pixels, filesize)"

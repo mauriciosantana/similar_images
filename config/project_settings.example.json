@@ -1,10 +1,10 @@
 {
   "_comment": "コピーしてプロジェクト直下に project_settings.json として保存し、パスを自分の環境に合わせて書き換えてください。",
-  "BASE_SAVE_DIR": "E:\\gaz 画像\\sns_media_download",
+  "BASE_SAVE_DIR": "",
   "EXIFTOOL_PATH": "C:\\Users\\mauri\\Program\\exiftool\\exiftool.exe",
-  "TEKETOU_TARGET_DIR": "E:\\path\\to\\sns_media_download\\SNS画像",
+  "TEKETOU_TARGET_DIR": "",
   "TEKETOU_TARGETS_FILE": "D:\\path\\to\\targets.txt",
-  "INJECT_NOJSON_DIR": "E:\\gaz 画像\\sns_media_download\\nojson",
+  "INJECT_NOJSON_DIR": "",
   "YOUTUBE_SAVE_DIR": "E:\\dow Download",
   "PDF2AVIF_INPUT_DIR": "D:\\path\\to\\pdf_folder",
   "PDF2AVIF_OUTPUT_DIR": null,

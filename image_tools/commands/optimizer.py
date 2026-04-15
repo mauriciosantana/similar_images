@@ -20,9 +20,9 @@ from image_tools import settings as app_settings
 # 設定 (Configuration)
 # ---------------------------------------------------------
 CONFIG = {
-    "WORKER_COUNT": 3,
+    "WORKER_COUNT": 2,
     "AVIF_QUALITY": 55,
-    "AVIF_SPEED": 6,
+    "AVIF_SPEED": 5,
     "IMAGE_EXTS": {'.avif', '.bmp', '.gif', '.jfif', '.jpg', '.jpeg', '.png', '.webp', '.tiff'},
     "TARGET_EXTS": {'.bmp', '.gif', '.jfif', '.jpg', '.jpeg', '.png', '.webp', '.tiff'},
     "ARCHIVE_EXTS": {'.zip', '.rar', '.7z'},
@@ -118,7 +118,7 @@ def count_total_folders(root_path):
 # ---------------------------------------------------------
 # 画像変換処理
 # ---------------------------------------------------------
-def process_single_image(file_path, as_grayscale=False):
+def process_single_image(file_path, as_grayscale=False, min_size_mb=0, max_size_mb=None):
     if not file_path.exists():
         return False, 0, None, file_path
 
@@ -127,6 +127,16 @@ def process_single_image(file_path, as_grayscale=False):
     
     try:
         original_size = file_path.stat().st_size
+        size_mb = original_size / (1024 * 1024)
+
+        # 容量条件の判定
+        if size_mb < min_size_mb:
+            # 最小サイズ未満はスキップ
+            return False, 0, None, file_path
+        
+        if max_size_mb is not None and size_mb > max_size_mb:
+            # 最大サイズ超過はスキップ
+            return False, 0, None, file_path
         
         with Image.open(file_path) as img:
             is_animated = getattr(img, "is_animated", False)
@@ -327,7 +337,12 @@ def process_images_in_folder(folder_path, executor, args):
     folder_replaced_count = 0
     to_delete = []
     
-    futures = {executor.submit(process_single_image, img, args.grayscale): img for img in candidates}
+    futures = {
+        executor.submit(
+            process_single_image, img, args.grayscale, args.min_size, args.max_size
+        ): img 
+        for img in candidates
+    }
     
     desc = f" Converting imgs"
     
@@ -407,22 +422,29 @@ def main():
     parser.add_argument("--zip", action="store_true", help="Pack folders into uncompressed zip after processing")
     parser.add_argument("--grayscale", action="store_true", help="Convert images to grayscale (L/LA)")
     parser.add_argument("--workers", type=int, default=CONFIG['WORKER_COUNT'], help="Number of worker processes")
-    parser.add_argument(
-        "--no-pause",
-        action="store_true",
-        help="Do not wait for Enter at exit (for batch/automation)",
-    )
+    parser.add_argument("--min-size", type=float, default=0, help="Minimum file size in MB to process")
+    parser.add_argument("--max-size", type=float, default=None, help="Maximum file size in MB to process")
+    parser.add_argument("--ext", nargs="+", help="Target extensions to process (e.g., --ext jpg png)")
 
     args = parser.parse_args()
     CONFIG['WORKER_COUNT'] = args.workers
+
+    if args.ext:
+        new_targets = set()
+        for ext in args.ext:
+            ext = ext.lower()
+            if not ext.startswith("."):
+                ext = "." + ext
+            new_targets.add(ext)
+        CONFIG['TARGET_EXTS'] = new_targets
+        # 指定された拡張子を確実に画像として認識させるため IMAGE_EXTS にも追加
+        CONFIG['IMAGE_EXTS'] = CONFIG['IMAGE_EXTS'].union(new_targets)
 
     set_low_priority()
     target_root = Path(args.root_dir).resolve()
     
     if not target_root.exists():
         print("❌ 指定されたフォルダが存在しません。")
-        if not args.no_pause:
-            input("Press Enter to exit...")
         return
 
     print(f"🚀 Processing Start: {target_root}")
@@ -447,8 +469,6 @@ def main():
         traceback.print_exc()
     
     global_stats.print_summary()
-    if not args.no_pause:
-        input("Press Enter to exit...")
 
 if __name__ == "__main__":
     main()

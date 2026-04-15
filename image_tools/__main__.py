@@ -21,7 +21,7 @@ def usage_text() -> str:
         "  inject           nojson 向けメタデータ注入\n"
         "  youtube          YouTube ダウンロード (yt-dlp)\n"
         "  convert-json     旧 JSON キャッシュ → SQLite\n"
-        "  count-jpg        キャッシュDBから容量集計\n"
+        "  count            キャッシュDBから容量集計\n"
         "  pdf2avif         PDF → AVIF\n\n"
         "各コマンドの詳細: python run.py <command> --help\n"
         "設定ファイルの説明は config\\README.txt を参照。\n"
@@ -77,8 +77,8 @@ def _run_convert_json() -> None:
     run()
 
 
-def _run_count_jpg() -> None:
-    from image_tools.commands.count_jpg import main as run
+def _run_count() -> None:
+    from image_tools.commands.count import main as run
 
     run()
 
@@ -103,7 +103,7 @@ _COMMAND_HANDLERS: dict[str, Callable[[], None]] = {
     "inject": _run_inject,
     "youtube": _run_youtube,
     "convert-json": _run_convert_json,
-    "count-jpg": _run_count_jpg,
+    "count": _run_count,
     "pdf2avif": _run_pdf2avif,
 }
 

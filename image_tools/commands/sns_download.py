@@ -192,7 +192,16 @@ def extract_name_from_meta(platform, meta):
         user_info = meta.get("user", {})
         return meta.get("author", {}).get("nick") or user_info.get("nick") or user_info.get("name")
     elif platform == "pixiv":
-        return meta.get("userName") or meta.get("user", {}).get("name") or meta.get("body", {}).get("userName") or meta.get("author")
+        # Pixivのメタデータ構造の変更や多様なパターンに対応
+        name = meta.get("userName")
+        if not name and isinstance(meta.get("user"), dict):
+            name = meta.get("user", {}).get("name")
+        if not name and isinstance(meta.get("body"), dict):
+            name = meta.get("body", {}).get("userName")
+        if not name:
+            author = meta.get("author")
+            name = author.get("name") if isinstance(author, dict) else author
+        return name
     elif platform == "instagram":
         return meta.get("owner", {}).get("full_name") or meta.get("user", {}).get("full_name") or meta.get("username")
     return None
@@ -679,7 +688,7 @@ def download_account(platform, account, config, completed_accounts, bg_executor,
     
     command = [
         "gallery-dl", "--cookies", COOKIES_FILE, "--download-archive", ARCHIVE_FILE,
-        "--sleep", "5-7", "--sleep-request", "5-7", "-d", BASE_SAVE_DIR,       
+        "--sleep", "4-6", "--sleep-request", "4-6", "-d", BASE_SAVE_DIR,       
         "-o", "directory=.", "-o", f"filename={prefix}_{account}_{{date:%Y%m%d_%H%M%S}}_{{id}}_{{num}}.{{extension}}",
         "--write-metadata", "--exec", "cmd /c echo GAL_DL_SUCCESS:::{}"
     ]
@@ -837,7 +846,7 @@ def run_downloader(do_organize=True):
 
     try:
         with concurrent.futures.ThreadPoolExecutor(max_workers=4) as bg_executor:
-            for platform in ["pixiv", "twitter"]:
+            for platform in ["twitter", "pixiv"]:
                 accounts = targets.get(platform, [])
                 if not accounts: continue
                 
