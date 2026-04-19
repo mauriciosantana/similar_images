@@ -13,6 +13,49 @@ EXIFTOOL_PATH = _S.get("EXIFTOOL_PATH") or ""
 WAITING_DIR = BASE_SAVE_DIR
 TARGET_INJECT_DIR = _S.get("INJECT_NOJSON_DIR") or ""
 
+class FastExifTool:
+    """ExifToolを常駐させて高速に処理するクラス"""
+    def __init__(self, executable):
+        self.executable = executable
+        self.process = None
+
+    def start(self):
+        if not self.executable or not os.path.exists(self.executable):
+            return
+        creationflags = 0x08000000 if os.name == 'nt' else 0
+        self.process = subprocess.Popen(
+            [self.executable, "-stay_open", "True", "-@", "-"],
+            stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+            text=True, encoding="utf-8", bufsize=1, creationflags=creationflags
+        )
+
+    def execute(self, *args):
+        if not self.process or self.process.poll() is not None:
+            self.start()
+        if not self.process:
+            return False, "ExifTool not found"
+        
+        for arg in args:
+            self.process.stdin.write(arg + "\n")
+        self.process.stdin.write("-execute\n")
+        self.process.stdin.flush()
+        
+        output = ""
+        while True:
+            line = self.process.stdout.readline()
+            if not line or line.strip() == "{ready}": break
+            output += line
+        return "files updated" in output or "image files read" in output, output
+
+    def stop(self):
+        if self.process:
+            try:
+                self.process.stdin.write("-stay_open\nFalse\n")
+                self.process.stdin.flush()
+                self.process.wait(timeout=2)
+            except:
+                self.process.kill()
+
 def is_match(base_name, file_name):
     name_idx = file_name.find(base_name)
     if name_idx == -1: return False
@@ -72,6 +115,8 @@ def inject_and_cleanup():
         print(f"❌ エラー: exiftool.exeが見つかりません。")
         return
 
+    fast_exiftool = FastExifTool(exiftool_path)
+
     json_files = glob.glob(os.path.join(metadata_dir, "*.json"))
     total = len(json_files)
     if total == 0:
@@ -116,8 +161,7 @@ def inject_and_cleanup():
 
             # --- 手順2: ExifToolで新しいメタデータを書き込む ---
             # ここでさらに強力なオプションを追加
-            cmd = [
-                exiftool_path,
+            args = [
                 "-overwrite_original",
                 "-m",         # マイナーエラーを無視
                 "-F",         # 壊れたファイルの修復を試みる(Fix)
@@ -128,13 +172,11 @@ def inject_and_cleanup():
                 media_path
             ]
             
-            res = subprocess.run(cmd, capture_output=True)
-            if res.returncode == 0:
+            success, output = fast_exiftool.execute(*args)
+            if success:
                 success_any = True
             else:
-                try: err = res.stderr.decode('cp932')
-                except: err = str(res.stderr)
-                print(f"\n❌ 失敗 ({os.path.basename(media_path)}): {err.strip()}")
+                print(f"\n❌ 失敗 ({os.path.basename(media_path)}): {output.strip()}")
 
         if success_any:
             try:
@@ -142,6 +184,7 @@ def inject_and_cleanup():
                 injected_count += 1
             except: pass
 
+    fast_exiftool.stop()
     print(f"\n\n✨ 完了レポート：成功 {injected_count} / 待機 {skipped_count} / 消失 {not_found_count}")
 
 if __name__ == "__main__":

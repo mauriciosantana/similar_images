@@ -8,13 +8,16 @@ import send2trash
 import time
 import psutil
 import subprocess
+import sqlite3
 from pathlib import Path
+from collections import defaultdict
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from tqdm import tqdm
-from PIL import Image, ImageSequence, UnidentifiedImageError
+from PIL import Image, ImageSequence, UnidentifiedImageError, ImageOps
 import io
 
 from image_tools import settings as app_settings
+from image_tools.paths import hash_cache_db
 
 # ---------------------------------------------------------
 # 設定 (Configuration)
@@ -65,6 +68,56 @@ global_stats = Stats()
 # ---------------------------------------------------------
 # システム設定・ヘルパー
 # ---------------------------------------------------------
+class FastExifTool:
+    """ExifToolを常駐させて高速に処理するクラス"""
+    def __init__(self, executable):
+        self.executable = executable
+        self.process = None
+
+    def start(self):
+        if not self.executable or not os.path.exists(self.executable):
+            return
+        creationflags = 0x08000000 if os.name == 'nt' else 0
+        self.process = subprocess.Popen(
+            [self.executable, "-stay_open", "True", "-@", "-"],
+            stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+            text=True, encoding="utf-8", bufsize=1, creationflags=creationflags
+        )
+
+    def execute(self, *args):
+        if not self.process or self.process.poll() is not None:
+            self.start()
+        if not self.process:
+            return False
+        
+        for arg in args:
+            self.process.stdin.write(arg + "\n")
+        self.process.stdin.write("-execute\n")
+        self.process.stdin.flush()
+        
+        output = ""
+        while True:
+            line = self.process.stdout.readline()
+            if not line or line.strip() == "{ready}": break
+            output += line
+        return "files updated" in output or "image files read" in output
+
+    def stop(self):
+        if self.process:
+            try:
+                self.process.stdin.write("-stay_open\nFalse\n")
+                self.process.stdin.flush()
+                self.process.wait(timeout=2)
+            except:
+                self.process.kill()
+
+# 各ワーカープロセスごとのグローバルインスタンス
+worker_exiftool = None
+
+def init_worker(exiftool_path):
+    global worker_exiftool
+    worker_exiftool = FastExifTool(exiftool_path)
+
 def set_low_priority():
     try:
         p = psutil.Process(os.getpid())
@@ -75,11 +128,49 @@ def set_low_priority():
     except Exception:
         pass
 
-def is_image(path):
-    return path.suffix.lower() in CONFIG['IMAGE_EXTS']
+def get_db_cache():
+    """DBからパス、サイズ、更新日時を取得して辞書で返す"""
+    db_path = hash_cache_db()
+    if not db_path.exists():
+        return {}
+    
+    cache = {}
+    try:
+        conn = sqlite3.connect(db_path)
+        cursor = conn.cursor()
+        # similar.py のスキーマ: 0:path, 1:mtime, 2:filesize
+        cursor.execute("SELECT path, filesize, mtime FROM images")
+        for row in cursor.fetchall():
+            cache[row[0]] = {"filesize": row[1], "mtime": row[2]}
+        conn.close()
+    except Exception as e:
+        print(f"⚠️  DB Cache load failed: {e}")
+    return cache
 
-def is_archive(path):
-    return path.suffix.lower() in CONFIG['ARCHIVE_EXTS']
+def get_optimizer_mtimes():
+    """最適化済みのフォルダMTimeキャッシュを取得"""
+    db_path = hash_cache_db()
+    if not db_path.exists(): return {}
+    cache = {}
+    try:
+        conn = sqlite3.connect(db_path)
+        c = conn.cursor()
+        c.execute("CREATE TABLE IF NOT EXISTS optimizer_mtimes (path TEXT PRIMARY KEY, mtime REAL)")
+        c.execute("SELECT path, mtime FROM optimizer_mtimes")
+        cache = dict(c.fetchall())
+        conn.close()
+    except Exception: pass
+    return cache
+
+def update_optimizer_mtime(folder_path, mtime):
+    db_path = hash_cache_db()
+    try:
+        conn = sqlite3.connect(db_path)
+        c = conn.cursor()
+        c.execute("INSERT OR REPLACE INTO optimizer_mtimes VALUES (?, ?)", (str(folder_path), mtime))
+        conn.commit()
+        conn.close()
+    except Exception: pass
 
 def safe_delete(path):
     try:
@@ -97,28 +188,25 @@ def get_folder_contents(folder_path):
     archives = []
     folders = []
     try:
-        if folder_path.exists(): 
-            for item in folder_path.iterdir():
-                if item.is_dir():
-                    folders.append(item)
-                elif is_image(item):
-                    images.append(item)
-                elif is_archive(item):
-                    archives.append(item)
+        with os.scandir(folder_path) as it:
+            for entry in it:
+                p = Path(entry.path)
+                if entry.is_dir():
+                    folders.append(p)
+                elif entry.is_file():
+                    ext = p.suffix.lower()
+                    if ext in CONFIG['IMAGE_EXTS']:
+                        images.append(p)
+                    elif ext in CONFIG['ARCHIVE_EXTS']:
+                        archives.append(p)
     except FileNotFoundError:
         pass
     return folders, images, archives
 
-def count_total_folders(root_path):
-    count = 0
-    for _, dirs, _ in os.walk(root_path):
-        count += len(dirs)
-    return count + 1 
-
 # ---------------------------------------------------------
 # 画像変換処理
 # ---------------------------------------------------------
-def process_single_image(file_path, as_grayscale=False, min_size_mb=0, max_size_mb=None):
+def process_single_image(file_path, as_grayscale=False, min_size_mb=0, max_size_mb=None, target_size=None):
     if not file_path.exists():
         return False, 0, None, file_path
 
@@ -160,12 +248,24 @@ def process_single_image(file_path, as_grayscale=False, min_size_mb=0, max_size_
             if is_animated:
                 frames = []
                 for frame in ImageSequence.Iterator(img):
-                    f = frame.copy().convert("RGBA")
+                    f = frame.copy()
+                    # EXIFを反映した上でリサイズ
+                    f = ImageOps.exif_transpose(f)
+                    if target_size:
+                        f = f.resize(target_size, Image.LANCZOS)
+                    f = f.convert("RGBA")
                     if as_grayscale:
                         f = f.convert("LA")
                     frames.append(f)
                 frames[0].save(buffer, save_all=True, append_images=frames[1:], **save_kwargs)
             else:
+                # EXIFを反映（回転など）
+                img = ImageOps.exif_transpose(img)
+                
+                # フォルダ内の他画像とサイズを合わせる
+                if target_size:
+                    img = img.resize(target_size, Image.LANCZOS)
+
                 if as_grayscale:
                     if img.mode == 'RGBA' or 'transparency' in img.info:
                         img = img.convert("LA")
@@ -175,7 +275,8 @@ def process_single_image(file_path, as_grayscale=False, min_size_mb=0, max_size_
 
             new_size = buffer.tell()
             
-            if new_size < original_size:
+            # 容量が減った場合、またはサイズ統一(align)指定がある場合は置き換える
+            if new_size < original_size or target_size is not None:
                 new_path = file_path.with_suffix('.avif')
                 
                 # 同名ファイル(既に.avif)の場合は一時ファイルを経由する
@@ -187,15 +288,13 @@ def process_single_image(file_path, as_grayscale=False, min_size_mb=0, max_size_
                 
                 # ExifToolでメタデータコピー (絶対パスを使用)
                 exiftool_path = CONFIG.get('EXIFTOOL_PATH', '')
-                if os.path.exists(exiftool_path):
-                    cmd = [
-                        exiftool_path,
+                if worker_exiftool:
+                    worker_exiftool.execute(
                         "-TagsFromFile", str(file_path.resolve()),
                         "-all:all",
                         "-overwrite_original",
                         str(temp_path.resolve())
-                    ]
-                    subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                    )
 
                 # 同名ファイルだった場合は、一時ファイルで元ファイルを上書き
                 if is_same_file:
@@ -326,12 +425,48 @@ def pack_to_zip(folder_path):
         if zip_path.exists():
             safe_delete(zip_path)
 
-def process_images_in_folder(folder_path, executor, args):
-    _, images, _ = get_folder_contents(folder_path)
-    candidates = [img for img in images if img.suffix.lower() in CONFIG['TARGET_EXTS']]
+def process_images_in_folder(folder_path, executor, args, db_cache=None, image_list=None):
+    if image_list is not None:
+        images = image_list
+    else:
+        _, images, _ = get_folder_contents(folder_path)
+    
+    # 拡張子フィルタリング
+    candidates = []
+    for img in images:
+        if img.suffix.lower() not in CONFIG['TARGET_EXTS']:
+            continue
+            
+        # DBキャッシュを利用した容量フィルタリングの高速化
+        img_abs = str(img.resolve())
+        if db_cache and img_abs in db_cache:
+            info = db_cache[img_abs]
+            size_mb = info['filesize'] / (1024 * 1024)
+            if size_mb < args.min_size:
+                continue
+            if args.max_size is not None and size_mb > args.max_size:
+                continue
+                
+        candidates.append(img)
     
     if not candidates:
         return
+
+    # フォルダ内の最大サイズを算出 (プレ走査)
+    target_size = None
+    if getattr(args, 'align', False):
+        max_w, max_h = 0, 0
+        for img_path in candidates:
+            try:
+                with Image.open(img_path) as tmp:
+                    # 正確なサイズ取得のためEXIF考慮
+                    tmp = ImageOps.exif_transpose(tmp)
+                    w, h = tmp.size
+                    if w > max_w: max_w = w
+                    if h > max_h: max_h = h
+            except: continue
+        if max_w > 0 and max_h > 0:
+            target_size = (max_w, max_h)
 
     folder_saved_bytes = 0
     folder_replaced_count = 0
@@ -339,7 +474,7 @@ def process_images_in_folder(folder_path, executor, args):
     
     futures = {
         executor.submit(
-            process_single_image, img, args.grayscale, args.min_size, args.max_size
+            process_single_image, img, args.grayscale, args.min_size, args.max_size, target_size
         ): img 
         for img in candidates
     }
@@ -379,39 +514,52 @@ def process_images_in_folder(folder_path, executor, args):
         global_stats.replaced_count += folder_replaced_count
         global_stats.saved_bytes += folder_saved_bytes
 
-def process_directory(current_path, executor, args, pbar_global):
+def process_directory(current_path, executor, args, pbar_global, db_cache=None, opt_mtimes=None):
     if not current_path.exists():
         return
 
-    while True:
-        changed = flatten_directory(current_path)
-        if not changed:
-            break
+    # フォルダの現在の更新日時を取得
+    try:
+        current_mtime = os.path.getmtime(current_path)
+    except OSError:
+        return
+
+    # 変更がない場合はスキップ（ただし初回や強制実行時は除く）
+    cached_mtime = (opt_mtimes or {}).get(str(current_path))
+    needs_processing = (cached_mtime != current_mtime)
 
     folders, images, archives = get_folder_contents(current_path)
 
-    for arc in archives:
-        if arc.exists():
-            handle_archive(arc, executor, args, pbar_global)
-    
+    if needs_processing:
+        # フォルダ構造の整理
+        while True:
+            if not flatten_directory(current_path): break
+
+        # 圧縮ファイルの展開
+        for arc in archives:
+            if arc.exists():
+                handle_archive(arc, executor, args, pbar_global)
+
+    # 子フォルダは常に再帰的にチェック（その中身が変更されている可能性があるため）
     folders_refreshed, _, _ = get_folder_contents(current_path)
-    
     for folder in folders_refreshed:
-        process_directory(folder, executor, args, pbar_global)
+        process_directory(folder, executor, args, pbar_global, db_cache=db_cache, opt_mtimes=opt_mtimes)
+            
+    if needs_processing:
+        # 画像の最適化（ここが抜けていました）
+        process_images_in_folder(current_path, executor, args, db_cache=db_cache)
 
-    while True:
-        changed = flatten_directory(current_path)
-        if not changed:
-            break
-
-    process_images_in_folder(current_path, executor, args)
-
-    if args.zip:
-        pack_to_zip(current_path)
+        if args.zip:
+            pack_to_zip(current_path)
+        
+        # 処理が終わった時点のMTimeを記録
+        try:
+            final_mtime = os.path.getmtime(current_path)
+            update_optimizer_mtime(current_path, final_mtime)
+        except OSError: pass
 
     if pbar_global:
         pbar_global.update(1)
-        pbar_global.set_description(f"Scanning: {current_path.name[:20]}")
 
 # ---------------------------------------------------------
 # メイン
@@ -421,10 +569,12 @@ def main():
     parser.add_argument("root_dir", type=str, help="Target root directory path")
     parser.add_argument("--zip", action="store_true", help="Pack folders into uncompressed zip after processing")
     parser.add_argument("--grayscale", action="store_true", help="Convert images to grayscale (L/LA)")
+    parser.add_argument("--align", action="store_true", help="Unify image dimensions to the maximum found in each folder")
     parser.add_argument("--workers", type=int, default=CONFIG['WORKER_COUNT'], help="Number of worker processes")
     parser.add_argument("--min-size", type=float, default=0, help="Minimum file size in MB to process")
     parser.add_argument("--max-size", type=float, default=None, help="Maximum file size in MB to process")
     parser.add_argument("--ext", nargs="+", help="Target extensions to process (e.g., --ext jpg png)")
+    parser.add_argument("--db-only", action="store_true", help="Only process images already registered in the database")
 
     args = parser.parse_args()
     CONFIG['WORKER_COUNT'] = args.workers
@@ -452,14 +602,42 @@ def main():
     if args.zip: mode_info.append("Zip:ON")
     if args.grayscale: mode_info.append("Grayscale:ON")
     
-    print("📂 フォルダ総数を計算中...")
-    total_folders = count_total_folders(target_root)
-    print(f"ℹ️  Target Folders: {total_folders}, Modes: {', '.join(mode_info) if mode_info else 'Normal'}")
+    db_cache = get_db_cache()
+    opt_mtimes = get_optimizer_mtimes()
+    images_by_folder = None
+
+    if args.db_only:
+        print("🗄️  データベースから対象画像を抽出中 (DB-ONLY モード)...")
+        images_by_folder = defaultdict(list)
+        target_prefix = str(target_root.resolve()) + os.sep
+        for path_str, info in db_cache.items():
+            if path_str.startswith(target_prefix):
+                p = Path(path_str)
+                images_by_folder[p.parent].append(p)
+        total_folders = len(images_by_folder)
+    else:
+        total_folders = None # プレ走査をスキップ
 
     try:
         with tqdm(total=total_folders, unit="dir", position=0, leave=True) as pbar:
-            with ProcessPoolExecutor(max_workers=CONFIG['WORKER_COUNT']) as executor:
-                process_directory(target_root, executor, args, pbar)
+            # initializerを使用して各ワーカーでExifToolを起動
+            with ProcessPoolExecutor(
+                max_workers=CONFIG['WORKER_COUNT'],
+                initializer=init_worker,
+                initargs=(CONFIG['EXIFTOOL_PATH'],)
+            ) as executor:
+                if args.db_only:
+                    # DBにあるパスのみを対象にする (実ファイルスキャンをスキップ)
+                    # 注意: このモードではアーカイブ展開やディレクトリの平坦化は行われません
+                    for folder_path, image_list in images_by_folder.items():
+                        pbar.set_description(f"Processing: {folder_path.name[:20]}")
+                        process_images_in_folder(folder_path, executor, args, db_cache=db_cache, image_list=image_list)
+                        if args.zip:
+                            # ZIP化する場合は実際のフォルダ内容を確認する必要がある
+                            pack_to_zip(folder_path)
+                        pbar.update(1)
+                else:
+                    process_directory(target_root, executor, args, pbar, db_cache=db_cache, opt_mtimes=opt_mtimes)
             
     except KeyboardInterrupt:
         print("\n⚠️  処理が中断されました。")

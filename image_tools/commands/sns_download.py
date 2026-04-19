@@ -9,6 +9,7 @@ import concurrent.futures
 import re
 import threading
 import queue
+import argparse
 
 try:
     import msvcrt
@@ -188,30 +189,35 @@ def extract_name_from_meta(platform, meta):
     if not isinstance(meta, dict):
         return None
 
+    name = None
     if platform == "twitter":
+        # ハンドル名(nick)より表示名(name)を優先して取得
         user_info = meta.get("user", {})
-        return meta.get("author", {}).get("nick") or user_info.get("nick") or user_info.get("name")
+        author_info = meta.get("author", {})
+        name = author_info.get("name") or user_info.get("name") or author_info.get("nick") or user_info.get("nick")
     elif platform == "pixiv":
-        # Pixivのメタデータ構造の変更や多様なパターンに対応
-        name = meta.get("userName")
-        if not name and isinstance(meta.get("user"), dict):
-            name = meta.get("user", {}).get("name")
-        if not name and isinstance(meta.get("body"), dict):
-            name = meta.get("body", {}).get("userName")
-        if not name:
-            author = meta.get("author")
-            name = author.get("name") if isinstance(author, dict) else author
-        return name
+        # Pixiv: 多様なメタデータ構造から名前を抽出
+        user = meta.get("user") or {}
+        author = meta.get("author") or {}
+        body = meta.get("body") or {}
+        
+        name = (meta.get("userName") or 
+                (user.get("name") if isinstance(user, dict) else None) or 
+                (body.get("userName") if isinstance(body, dict) else None) or 
+                (author.get("name") if isinstance(author, dict) else author if isinstance(author, str) else None) or
+                (author.get("nick") if isinstance(author, dict) else None))
     elif platform == "instagram":
-        return meta.get("owner", {}).get("full_name") or meta.get("user", {}).get("full_name") or meta.get("username")
-    return None
+        name = meta.get("owner", {}).get("full_name") or meta.get("user", {}).get("full_name") or meta.get("username")
+    
+    return name.strip() if name and isinstance(name, str) else name
 
 def get_account_name(platform, prefix, account_id):
     if platform == "twitter_hashtag":
         return f"#{account_id}"
         
     cache = load_name_cache()
-    cache_key = f"{platform}:{account_id}"
+    # IDの大小文字による不一致を防ぐためキーを小文字化
+    cache_key = f"{platform}:{account_id.lower()}"
     
     if cache_key in cache:
         return cache[cache_key]
@@ -642,7 +648,8 @@ def inject_and_organize_files():
                     meta = load_cached_json(src_path)
                     name = extract_name_from_meta(pf, meta)
                     if name:
-                        cache_key = f"{pf}:{account_id}"
+                        # キーを小文字化して照合
+                        cache_key = f"{pf}:{account_id.lower()}"
                         if name_cache.get(cache_key) != name:
                             name_cache[cache_key] = name
                             save_name_cache(name_cache)
@@ -801,7 +808,8 @@ def download_account(platform, account, config, completed_accounts, bg_executor,
                                     account_name = extracted_name
                                     display_name = f"{account_name} ({account})"
                                     cache = load_name_cache()
-                                    cache[identifier] = account_name
+                                    # キャッシュ保存時もキーを正規化
+                                    cache[identifier.lower()] = account_name
                                     save_name_cache(cache)
                             except Exception:
                                 pass
@@ -830,11 +838,14 @@ def download_account(platform, account, config, completed_accounts, bg_executor,
         FAST_EXIFTOOL.stop() # 終了時に常駐プロセスも安全に切断
         sys.exit(0)
 
-def run_downloader(do_organize=True):
+def run_downloader(do_organize=True, platforms=None):
     require_setting_str("BASE_SAVE_DIR")
     completed_accounts = load_completed_list()
     targets = load_targets()
     os.makedirs(BASE_SAVE_DIR, exist_ok=True)
+
+    if platforms is None:
+        platforms = ["pixiv", "twitter"]
 
     targets_filepath = (
         TARGETS_FILE
@@ -846,7 +857,7 @@ def run_downloader(do_organize=True):
 
     try:
         with concurrent.futures.ThreadPoolExecutor(max_workers=4) as bg_executor:
-            for platform in ["twitter", "pixiv"]:
+            for platform in platforms:
                 accounts = targets.get(platform, [])
                 if not accounts: continue
                 
@@ -873,6 +884,27 @@ def run_downloader(do_organize=True):
         # ★ 全処理終了時に常駐ExifToolを安全に閉じる
         FAST_EXIFTOOL.stop()
 
+def main():
+    parser = argparse.ArgumentParser(description="SNS Downloader with Gallery-dl")
+    parser.add_argument("-t", "--twitter", action="store_true", help="Twitterを対象にする")
+    parser.add_argument("-p", "--pixiv", action="store_true", help="Pixivを対象にする")
+    parser.add_argument("-i", "--instagram", action="store_true", help="Instagramを対象にする")
+    parser.add_argument("-tg", "--hashtag", action="store_true", help="Twitterハッシュタグを対象にする")
+    parser.add_argument("--skip-organize", action="store_true", help="ダウンロード後のファイル整理をスキップする")
+    
+    args = parser.parse_args()
+    
+    selected_platforms = []
+    if args.twitter: selected_platforms.append("twitter")
+    if args.pixiv: selected_platforms.append("pixiv")
+    if args.instagram: selected_platforms.append("instagram")
+    if args.hashtag: selected_platforms.append("twitter_hashtag")
+    
+    # 引数指定がない場合は、従来の挙動（Pixiv）をデフォルトにする
+    if not selected_platforms:
+        selected_platforms = ["pixiv", "twitter"]
+        
+    run_downloader(do_organize=not args.skip_organize, platforms=selected_platforms)
+
 if __name__ == "__main__":
-    do_organize = "--skip-organize" not in sys.argv
-    run_downloader(do_organize=do_organize)
+    main()

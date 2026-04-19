@@ -89,11 +89,9 @@ def _run_pdf2avif() -> None:
     run()
 
 
-def _run_sns(rest: list[str]) -> None:
-    from image_tools.commands.sns_download import run_downloader
-
-    do_organize = "--skip-organize" not in rest
-    run_downloader(do_organize=do_organize)
+def _run_sns() -> None:
+    from image_tools.commands.sns_download import main as run
+    run()
 
 
 _COMMAND_HANDLERS: dict[str, Callable[[], None]] = {
@@ -123,7 +121,7 @@ def main() -> None:
     sys.argv = [sys.argv[0]] + rest
 
     if cmd == "sns":
-        _run_sns(rest)
+        _run_sns()
         return
 
     handler = _COMMAND_HANDLERS.get(cmd)

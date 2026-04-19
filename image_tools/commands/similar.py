@@ -26,6 +26,7 @@ import imagehash
 from send2trash import send2trash
 import pybktree
 import concurrent.futures
+from concurrent.futures import ThreadPoolExecutor
 from tqdm import tqdm
 
 try:
@@ -328,8 +329,9 @@ class SimilarImageApp(tk.Tk):
         self.current_filtered_infos = []
         self.current_auto_trash = []
         self.last_action_msg = ""
+        self.thumbnail_executor = ThreadPoolExecutor(max_workers=4)
         
-        self.title("類似画像チェッカー - キーボードでサクサク整理！")
+        self.title("類似画像チェッカー")
         try:
             self.state('zoomed')
         except:
@@ -452,7 +454,6 @@ class SimilarImageApp(tk.Tk):
             row_idx = i // max_cols
             col_idx = i % max_cols
             frame.grid(row=row_idx, column=col_idx, sticky="nsew", padx=5, pady=5)
-
             ext = Path(info["path"]).suffix.upper()
             ratio = info["pixels"] / max_pixels
 
@@ -469,20 +470,32 @@ class SimilarImageApp(tk.Tk):
             lbl = tk.Label(frame, text=txt, font=("Meiryo", 12, "bold"), fg=color, bg=bg_color)
             lbl.pack(side=tk.TOP, pady=5)
 
-            try:
-                with Image.open(info["path"]) as img:
-                    img = ImageOps.exif_transpose(img)
-                    img.thumbnail((img_w, img_h))
-                    pimg = ImageTk.PhotoImage(img)
-                    self.photo_refs.append(pimg)
-                    img_lbl = tk.Label(frame, image=pimg, bg=bg_color)
-                    img_lbl.pack(side=tk.TOP, expand=True)
-            except Exception as e:
-                logger.debug("サムネイル表示失敗: %s", info["path"], exc_info=True)
-                err_lbl = tk.Label(frame, text=f"読込エラー\n{e}", fg="red", bg=bg_color)
-                err_lbl.pack(side=tk.TOP, expand=True)
+            # プレースホルダー表示
+            img_lbl = tk.Label(frame, text="Loading...", bg=bg_color)
+            img_lbl.pack(side=tk.TOP, expand=True)
+            
+            # 非同期で画像を読み込み
+            self.thumbnail_executor.submit(self._load_thumbnail_async, info["path"], img_w, img_h, img_lbl, bg_color)
 
         status_text = f"Group {self.current_idx + 1} / {len(self.groups)}  [ {size_info_str} ]"
+
+    def _load_thumbnail_async(self, path, w, h, label, bg_color):
+        """別スレッドで画像を読み込み、GUIスレッドでラベルを更新する"""
+        try:
+            with Image.open(path) as img:
+                img = ImageOps.exif_transpose(img)
+                img.thumbnail((w, h))
+                pimg = ImageTk.PhotoImage(img)
+                # メインスレッドでラベルを更新
+                self.after(0, self._update_image_label, label, pimg)
+        except Exception as e:
+            self.after(0, lambda: label.config(text=f"Error\n{e}", fg="red"))
+
+    def _update_image_label(self, label, pimg):
+        if label.winfo_exists():
+            self.photo_refs.append(pimg) # 参照保持
+            label.config(image=pimg, text="")
+
         if self.last_action_msg:
             status_text = f"【前回の操作】 {self.last_action_msg}  |  " + status_text
 
@@ -605,6 +618,7 @@ class SimilarImageApp(tk.Tk):
 
             try:
                 success, saved, new_path, orig_path = optimizer.process_single_image(old_path, as_grayscale=False)
+                success, saved, new_path, orig_path = optimizer.process_single_image(old_path, as_grayscale=False, as_square=False)
                 
                 if success and new_path:
                     with Image.open(new_path) as test_img:
@@ -743,7 +757,7 @@ def scan_and_sync_files(args, config, conn, c, needs_scan, target_dirs_paths, to
     full_exclude_dirs = set(config["EXCLUDE_DIR_NAMES"])
     exclude_keywords = config["EXCLUDE_FILE_KEYWORDS"]
     
-    print(f"🔍 画像ファイルを検索中（変更のないサブフォルダはスキップします）...")
+    print(f"🔍 画像ファイルを検索中...")
     for t_dir in target_dirs_paths:
         if not t_dir.is_dir(): continue
         for root, dirs, files in os.walk(t_dir):
@@ -800,7 +814,7 @@ def scan_and_sync_files(args, config, conn, c, needs_scan, target_dirs_paths, to
         print(f"🚀 {len(to_compute)} 個の新規/更新ファイルを解析して保存します...")
         batch = []
         args_list = [(p, config["SOLID_TOLERANCE"]) for p in to_compute]
-        n_workers = min(16, os.cpu_count() or 1) # ワーカー数を現実的な範囲に制限
+        n_workers = os.cpu_count() or 3
         chunk = max(32, min(256, len(args_list) // (n_workers * 4) or 32))
         
         with concurrent.futures.ProcessPoolExecutor(max_workers=n_workers) as executor:
