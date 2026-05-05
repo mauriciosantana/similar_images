@@ -5,6 +5,7 @@ import os
 import sqlite3
 
 from image_tools.paths import hash_cache_db
+from image_tools.commands.similar import load_config
 from image_tools import settings as app_settings
 from image_tools.settings import missing_settings_message
 
@@ -66,8 +67,12 @@ def db_count_large_files(db_path: str, path_prefix: str, min_size_mb: float, ext
 
 def main() -> None:
     s = app_settings.load_settings()
-    base = s.get("BASE_SAVE_DIR")
-    default_prefix = os.path.join(base, "SNS画像") if base else None
+    config = load_config()
+    
+    # 集計の優先順位: 1. config.jsonのTARGET_DIRS, 2. project_settings.jsonのBASE_SAVE_DIR
+    target_dirs = config.get("TARGET_DIRS", [])
+    base_save_dir = s.get("BASE_SAVE_DIR")
+    default_prefix = target_dirs[0] if target_dirs else base_save_dir
 
     parser = argparse.ArgumentParser(
         description="DBを利用して指定した容量・拡張子のファイル数と合計容量を高速集計します。"
@@ -76,7 +81,7 @@ def main() -> None:
     parser.add_argument(
         "--ext",
         nargs="+",
-        default=["jpg", "jpeg"],
+        default=["jpg", "jpeg", "png"],
         help="対象拡張子（例: --ext png webp）",
     )
     parser.add_argument(
@@ -87,17 +92,18 @@ def main() -> None:
     parser.add_argument(
         "--prefix",
         default=None,
-        help="path の接頭辞（省略時は BASE_SAVE_DIR\\SNS画像。BASE_SAVE_DIR 未設定時は必須）",
+        help="集計対象のパス接頭辞 (例: E:\\gaz 画像\\SNS画像)",
     )
     args = parser.parse_args()
-    prefix = args.prefix
-    if prefix is None:
-        if not base:
-            raise SystemExit(
-                missing_settings_message("BASE_SAVE_DIR")
-                + "\nまたは --prefix で接頭辞を直接指定してください。"
-            )
-        prefix = default_prefix
+
+    prefix = args.prefix or default_prefix
+
+    if not prefix:
+        raise SystemExit(
+            "❌ エラー: 集計対象のパス（prefix）が特定できません。\n"
+            "config.json の TARGET_DIRS を設定するか、--prefix でパスを指定してください。"
+        )
+
     db_count_large_files(args.db, prefix, args.size, args.ext)
 
 

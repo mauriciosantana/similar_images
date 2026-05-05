@@ -8,16 +8,25 @@ import send2trash
 import time
 import psutil
 import subprocess
+import traceback
 import sqlite3
 from pathlib import Path
 from collections import defaultdict
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from tqdm import tqdm
-from PIL import Image, ImageSequence, UnidentifiedImageError, ImageOps
+from PIL import Image, ImageSequence, UnidentifiedImageError, ImageOps, ImageFile
 import io
 
 from image_tools import settings as app_settings
+from image_tools.commands.similar import load_config # config.json を読み込むため
 from image_tools.paths import hash_cache_db
+
+# ---------------------------------------------------------
+# Pillow 設定 (Pillow Settings)
+# ---------------------------------------------------------
+ImageFile.LOAD_TRUNCATED_IMAGES = True
+# 非常に大きい画像でもエラーにせず処理を試みる（メモリ不足は別途 catch する）
+Image.MAX_IMAGE_PIXELS = 5_000_000_000
 
 # ---------------------------------------------------------
 # 設定 (Configuration)
@@ -27,7 +36,7 @@ CONFIG = {
     "AVIF_QUALITY": 55,
     "AVIF_SPEED": 5,
     "IMAGE_EXTS": {'.avif', '.bmp', '.gif', '.jfif', '.jpg', '.jpeg', '.png', '.webp', '.tiff'},
-    "TARGET_EXTS": {'.bmp', '.gif', '.jfif', '.jpg', '.jpeg', '.png', '.webp', '.tiff'},
+    "TARGET_EXTS": {'.bmp', '.jfif', '.jpg', '.jpeg', '.png', '.webp', '.avif'},
     "ARCHIVE_EXTS": {'.zip', '.rar', '.7z'},
     "EXIFTOOL_PATH": app_settings.load_settings().get("EXIFTOOL_PATH") or "",
 }
@@ -176,7 +185,7 @@ def safe_delete(path):
     try:
         if not path.exists():
             return
-        if path.is_file() and is_image(path):
+        if path.is_file() and path.suffix.lower() in CONFIG['IMAGE_EXTS']:
             os.remove(path) 
         else:
             send2trash.send2trash(str(path))
@@ -203,10 +212,49 @@ def get_folder_contents(folder_path):
         pass
     return folders, images, archives
 
+def _save_avif_robust(img, buffer, save_kwargs, is_animated=False, frames=None):
+    """
+    AVIF保存の試行錯誤（4:4:4失敗時の4:2:0フォールバック、およびLAモード失敗時のRGBA変換）
+    """
+    # 再帰の深さを制限
+    attempt = save_kwargs.get("_retry_count", 0)
+    if attempt > 3:
+        raise MemoryError("AVIF conversion failed after multiple retries due to memory constraints.")
+
+    try:
+        if is_animated:
+            img.save(buffer, save_all=True, append_images=frames[1:], **save_kwargs)
+        else:
+            img.save(buffer, **save_kwargs)
+    except (Exception, MemoryError) as e:
+        save_kwargs["_retry_count"] = attempt + 1
+        err_msg = str(e).lower()
+        
+        # 1. 画像サイズが奇数の場合、偶数に微調整（エンコーダの制限回避）
+        w, h = img.size
+        if w % 2 != 0 or h % 2 != 0:
+            new_size = (w + (w % 2), h + (h % 2))
+            img = img.resize(new_size, resample=Image.LANCZOS)
+            if is_animated and frames:
+                frames = [f.resize(new_size, resample=Image.LANCZOS) for f in frames]
+            buffer.seek(0); buffer.truncate()
+            return _save_avif_robust(img, buffer, save_kwargs, is_animated, frames)
+
+        # 2. メモリ不足エラーの場合、タイリング(分割処理)を有効化し、サンプリングを下げる
+        if "tile_rows" not in save_kwargs:
+            save_kwargs["tile_rows"] = 2
+            save_kwargs["tile_cols"] = 2
+            # subsampling は 4:4:4 のまま維持し、タイル分割だけでメモリ削減を試みる
+            buffer.seek(0); buffer.truncate()
+            return _save_avif_robust(img, buffer, save_kwargs, is_animated, frames)
+        
+        # それ以外のエラー、またはフォールバック後も失敗した場合は呼び出し元へ
+        raise e
+
 # ---------------------------------------------------------
 # 画像変換処理
 # ---------------------------------------------------------
-def process_single_image(file_path, as_grayscale=False, min_size_mb=0, max_size_mb=None, target_size=None):
+def process_single_image(file_path, as_grayscale=None, min_size_mb=0, max_size_mb=None, target_size=None):
     if not file_path.exists():
         return False, 0, None, file_path
 
@@ -228,12 +276,26 @@ def process_single_image(file_path, as_grayscale=False, min_size_mb=0, max_size_
         
         with Image.open(file_path) as img:
             is_animated = getattr(img, "is_animated", False)
+
+            # 白黒化の判定（全対象 or 指定色数以下）
+            do_gs = False
+            if as_grayscale is True:
+                do_gs = True
+            elif isinstance(as_grayscale, int) and as_grayscale != 0:
+                if as_grayscale == -1:
+                    do_gs = True
+                else:
+                    # ユニーク色数が指定値以下なら白黒化の対象とする
+                    if img.getcolors(maxcolors=as_grayscale) is not None:
+                        do_gs = True
+
             buffer = io.BytesIO()
             save_kwargs = {
                 "format": "AVIF",
                 "quality": CONFIG['AVIF_QUALITY'],
                 "speed": CONFIG['AVIF_SPEED'],
                 "optimize": True,
+                "subsampling": "4:4:4",
             }
 
             if img.mode in ('P', 'PA') or (img.mode == 'RGBA') or ('transparency' in img.info):
@@ -246,6 +308,11 @@ def process_single_image(file_path, as_grayscale=False, min_size_mb=0, max_size_
                 save_kwargs['icc_profile'] = icc
             
             if is_animated:
+                # メモリ節約のため、透過が必要ない場合は RGB にする
+                target_mode = "RGBA" if (img.mode in ('RGBA', 'P', 'PA') or 'transparency' in img.info) else "RGB"
+                if do_gs:
+                    target_mode = "LA" if target_mode == "RGBA" else "L"
+
                 frames = []
                 for frame in ImageSequence.Iterator(img):
                     f = frame.copy()
@@ -253,11 +320,13 @@ def process_single_image(file_path, as_grayscale=False, min_size_mb=0, max_size_
                     f = ImageOps.exif_transpose(f)
                     if target_size:
                         f = f.resize(target_size, Image.LANCZOS)
-                    f = f.convert("RGBA")
-                    if as_grayscale:
-                        f = f.convert("LA")
+                    f = f.convert(target_mode)
                     frames.append(f)
-                frames[0].save(buffer, save_all=True, append_images=frames[1:], **save_kwargs)
+                
+                # オリジナルの巨大な img オブジェクトへの参照を早めに解放
+                del img
+                
+                _save_avif_robust(frames[0], buffer, save_kwargs, is_animated=True, frames=frames)
             else:
                 # EXIFを反映（回転など）
                 img = ImageOps.exif_transpose(img)
@@ -266,12 +335,13 @@ def process_single_image(file_path, as_grayscale=False, min_size_mb=0, max_size_
                 if target_size:
                     img = img.resize(target_size, Image.LANCZOS)
 
-                if as_grayscale:
+                if do_gs:
                     if img.mode == 'RGBA' or 'transparency' in img.info:
                         img = img.convert("LA")
                     else:
                         img = img.convert("L")
-                img.save(buffer, **save_kwargs)
+                
+                _save_avif_robust(img, buffer, save_kwargs)
 
             new_size = buffer.tell()
             
@@ -304,8 +374,23 @@ def process_single_image(file_path, as_grayscale=False, min_size_mb=0, max_size_
             else:
                 return False, 0, None, file_path
 
-    except (UnidentifiedImageError, OSError, Exception) as e:
-        # 処理中にエラーが起きた場合、作りかけの一時ファイルがあれば削除する
+    except (UnidentifiedImageError, SyntaxError, OSError) as e:
+        # 画像が壊れている、または拡張子と中身が一致しない場合（PillowはJPEG不正でSyntaxErrorを出すことがある）
+        print(f"\n⚠️  読み込み失敗（スキップ）: {file_path.name} ({e})")
+        if temp_path and temp_path.exists():
+            try: os.remove(temp_path)
+            except: pass
+        return False, 0, None, file_path
+    except MemoryError:
+        print(f"\n⚠️  メモリ不足によりスキップ: {file_path.name}")
+        if temp_path and temp_path.exists():
+            try: os.remove(temp_path)
+            except: pass
+        return False, 0, None, file_path
+    except Exception as e:
+        # その他の予期せぬシステムエラーなどはトレースを表示
+        print(f"\n❌ 予期せぬエラー ({file_path.name}): {e}")
+        traceback.print_exc()
         if temp_path and temp_path.exists():
             try:
                 os.remove(temp_path)
@@ -355,7 +440,7 @@ def handle_archive(file_path, executor, args, pbar_global):
             elif file_path.suffix.lower() == '.7z':
                 with py7zr.SevenZipFile(file_path, mode='r') as z:
                     z.extractall(path=extract_dir)
-            
+
             safe_delete(file_path)
             process_directory(extract_dir, executor, args, pbar_global)
 
@@ -425,16 +510,21 @@ def pack_to_zip(folder_path):
         if zip_path.exists():
             safe_delete(zip_path)
 
-def process_images_in_folder(folder_path, executor, args, db_cache=None, image_list=None):
+def process_images_in_folder(folder_path, executor, args, db_cache=None, image_list=None, exclude_file_keywords=None):
     if image_list is not None:
         images = image_list
     else:
         _, images, _ = get_folder_contents(folder_path)
     
+    folder_name = folder_path.name
     # 拡張子フィルタリング
     candidates = []
     for img in images:
         if img.suffix.lower() not in CONFIG['TARGET_EXTS']:
+            continue
+        
+        # 除外ファイルキーワードのチェック
+        if exclude_file_keywords and any(kw in img.name for kw in exclude_file_keywords):
             continue
             
         # DBキャッシュを利用した容量フィルタリングの高速化
@@ -479,7 +569,7 @@ def process_images_in_folder(folder_path, executor, args, db_cache=None, image_l
         for img in candidates
     }
     
-    desc = f" Converting imgs"
+    desc = f" 🖼️  Optimizing: {folder_name[:30]}"
     
     for future in tqdm(as_completed(futures), total=len(candidates), desc=desc, leave=False, unit="img"):
         success, saved, avif_path, original_path = future.result()
@@ -514,9 +604,13 @@ def process_images_in_folder(folder_path, executor, args, db_cache=None, image_l
         global_stats.replaced_count += folder_replaced_count
         global_stats.saved_bytes += folder_saved_bytes
 
-def process_directory(current_path, executor, args, pbar_global, db_cache=None, opt_mtimes=None):
+def process_directory(current_path, executor, args, pbar_global, db_cache=None, opt_mtimes=None, exclude_dir_names=None, exclude_file_keywords=None):
     if not current_path.exists():
         return
+
+    # 処理中のディレクトリをプログレスバーに表示
+    if pbar_global is not None:
+        pbar_global.set_description(f"📂 Processing: {current_path.name[:30]}")
 
     # フォルダの現在の更新日時を取得
     try:
@@ -524,9 +618,15 @@ def process_directory(current_path, executor, args, pbar_global, db_cache=None, 
     except OSError:
         return
 
+    current_path_str = str(current_path)
+    # 除外ディレクトリのチェック (名前一致 または 絶対パス一致)
+    if exclude_dir_names and (current_path.name in exclude_dir_names or current_path_str in exclude_dir_names):
+        print(f"⏭️ 除外ディレクトリ: {current_path}")
+        return
+
     # 変更がない場合はスキップ（ただし初回や強制実行時は除く）
     cached_mtime = (opt_mtimes or {}).get(str(current_path))
-    needs_processing = (cached_mtime != current_mtime)
+    needs_processing = getattr(args, 'force', False) or (cached_mtime != current_mtime)
 
     folders, images, archives = get_folder_contents(current_path)
 
@@ -543,11 +643,11 @@ def process_directory(current_path, executor, args, pbar_global, db_cache=None, 
     # 子フォルダは常に再帰的にチェック（その中身が変更されている可能性があるため）
     folders_refreshed, _, _ = get_folder_contents(current_path)
     for folder in folders_refreshed:
-        process_directory(folder, executor, args, pbar_global, db_cache=db_cache, opt_mtimes=opt_mtimes)
+        process_directory(folder, executor, args, pbar_global, db_cache=db_cache, opt_mtimes=opt_mtimes, exclude_dir_names=exclude_dir_names, exclude_file_keywords=exclude_file_keywords)
             
     if needs_processing:
         # 画像の最適化（ここが抜けていました）
-        process_images_in_folder(current_path, executor, args, db_cache=db_cache)
+        process_images_in_folder(current_path, executor, args, db_cache=db_cache, exclude_file_keywords=exclude_file_keywords)
 
         if args.zip:
             pack_to_zip(current_path)
@@ -558,7 +658,7 @@ def process_directory(current_path, executor, args, pbar_global, db_cache=None, 
             update_optimizer_mtime(current_path, final_mtime)
         except OSError: pass
 
-    if pbar_global:
+    if pbar_global is not None:
         pbar_global.update(1)
 
 # ---------------------------------------------------------
@@ -568,12 +668,13 @@ def main():
     parser = argparse.ArgumentParser(description="Image & Archive Optimizer Script V4.2")
     parser.add_argument("root_dir", type=str, help="Target root directory path")
     parser.add_argument("--zip", action="store_true", help="Pack folders into uncompressed zip after processing")
-    parser.add_argument("--grayscale", action="store_true", help="Convert images to grayscale (L/LA)")
+    parser.add_argument("-g", "--grayscale", type=int, nargs="?", const=-1, help="Convert to grayscale. If a number is specified (e.g., -g 16), only images with color counts below that threshold are converted.")
     parser.add_argument("--align", action="store_true", help="Unify image dimensions to the maximum found in each folder")
     parser.add_argument("--workers", type=int, default=CONFIG['WORKER_COUNT'], help="Number of worker processes")
     parser.add_argument("--min-size", type=float, default=0, help="Minimum file size in MB to process")
     parser.add_argument("--max-size", type=float, default=None, help="Maximum file size in MB to process")
     parser.add_argument("--ext", nargs="+", help="Target extensions to process (e.g., --ext jpg png)")
+    parser.add_argument("-f", "--force", action="store_true", help="Force process even if the directory hasn't changed")
     parser.add_argument("--db-only", action="store_true", help="Only process images already registered in the database")
 
     args = parser.parse_args()
@@ -593,11 +694,22 @@ def main():
     set_low_priority()
     target_root = Path(args.root_dir).resolve()
     
+    config = load_config() # config.json を読み込む
+    exclude_dir_names = set()
+    for d in config.get("EXCLUDE_DIR_NAMES", []):
+        exclude_dir_names.add(d)
+        try:
+            exclude_dir_names.add(str(Path(d).resolve()))
+        except: pass
+
+    exclude_file_keywords = config.get("EXCLUDE_FILE_KEYWORDS", [])
+
     if not target_root.exists():
         print("❌ 指定されたフォルダが存在しません。")
         return
 
     print(f"🚀 Processing Start: {target_root}")
+    print(f"⚙️  設定: 画質={CONFIG['AVIF_QUALITY']}, 速度={CONFIG['AVIF_SPEED']}")
     mode_info = []
     if args.zip: mode_info.append("Zip:ON")
     if args.grayscale: mode_info.append("Grayscale:ON")
@@ -630,14 +742,14 @@ def main():
                     # DBにあるパスのみを対象にする (実ファイルスキャンをスキップ)
                     # 注意: このモードではアーカイブ展開やディレクトリの平坦化は行われません
                     for folder_path, image_list in images_by_folder.items():
-                        pbar.set_description(f"Processing: {folder_path.name[:20]}")
+                        pbar.set_description(f"📂 Processing: {folder_path.name[:30]}")
                         process_images_in_folder(folder_path, executor, args, db_cache=db_cache, image_list=image_list)
                         if args.zip:
                             # ZIP化する場合は実際のフォルダ内容を確認する必要がある
                             pack_to_zip(folder_path)
-                        pbar.update(1)
+                        pbar.update(1) # DB-ONLYモードでもプログレスバーを更新
                 else:
-                    process_directory(target_root, executor, args, pbar, db_cache=db_cache, opt_mtimes=opt_mtimes)
+                    process_directory(target_root, executor, args, pbar, db_cache=db_cache, opt_mtimes=opt_mtimes, exclude_dir_names=exclude_dir_names, exclude_file_keywords=exclude_file_keywords)
             
     except KeyboardInterrupt:
         print("\n⚠️  処理が中断されました。")

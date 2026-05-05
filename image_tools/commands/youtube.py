@@ -1,36 +1,27 @@
 import yt_dlp
 import os
+import argparse
+from pathlib import Path
 
 from image_tools.paths import PROJECT_ROOT
 from image_tools import settings as app_settings
 from image_tools.settings import require_setting_str
 
-_S = app_settings.load_settings()
-
-# ＝＝＝ 設定エリア（このファイルを直接編集）＝＝＝
-TARGET_URLS = [
-    # ここにURLを入力
-    "https://www.youtube.com/shorts/VmvV1Xrbl7Q",
-]
-
-SAVE_DIR = _S.get("YOUTUBE_SAVE_DIR") or ""
-ARCHIVE_FILE = str(PROJECT_ROOT / "youtube_history.txt")
-DOWNLOAD_MODE = "video"  # "video" または "audio"
-AUDIO_FORMAT = "mp3" 
-
-def get_ydl_opts():
+def get_ydl_opts(save_dir: str, archive_file: str, mode: str = "video", audio_format: str = "mp3"):
+    """yt-dlp のオプションを取得する"""
+    save_path = Path(save_dir)
     opts = {
-        # 【改善】ファイル名の先頭に「投稿日(YYYYMMDD)」を付けて時系列ソートを完璧にする
-        'outtmpl': f'{SAVE_DIR}/%(upload_date)s_%(uploader)s_%(title)s_[%(id)s].%(ext)s',
-        'download_archive': ARCHIVE_FILE,
+        # ファイル名の先頭に「投稿日(YYYYMMDD)」を付けて時系列ソートを容易にする
+        'outtmpl': str(save_path / '%(upload_date)s_%(uploader)s_%(title)s_[%(id)s].%(ext)s'),
+        'download_archive': archive_file,
         'ignoreerrors': True,
-        'quiet': False,
+        'quiet': True,
         
         # 【改善】概要欄のテキストなどをJSONファイルとしても保存（gallery-dlと同じ形式）
         'writeinfojson': True,
     }
 
-    if DOWNLOAD_MODE == "video":
+    if mode == "video":
         opts['format'] = 'bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best'
         opts['merge_output_format'] = 'mp4'
         
@@ -50,39 +41,43 @@ def get_ydl_opts():
             {'key': 'EmbedThumbnail'},
         ]
         
-    elif DOWNLOAD_MODE == "audio":
+    elif mode == "audio":
         opts['format'] = 'bestaudio/best'
         
         # 【改善】音声向けのアーカイブ設定（メタデータとサムネイルの埋め込み）
         opts['writethumbnail'] = True
         opts['postprocessors'] = [
-            {'key': 'FFmpegExtractAudio', 'preferredcodec': AUDIO_FORMAT, 'preferredquality': '192'},
+            {'key': 'FFmpegExtractAudio', 'preferredcodec': audio_format, 'preferredquality': '192'},
             {'key': 'FFmpegMetadata', 'add_metadata': True},
             {'key': 'EmbedThumbnail'},
         ]
         
     return opts
 
-def run_youtube_downloader():
+def run_youtube_downloader(urls: list, mode: str = "video", audio_format: str = "mp3"):
+    """ダウンロードメイン処理"""
     require_setting_str("YOUTUBE_SAVE_DIR")
-    os.makedirs(SAVE_DIR, exist_ok=True)
-    print(f"🚀 YouTube高耐久アーカイブ処理を開始します（モード: {DOWNLOAD_MODE}）...\n")
+    settings = app_settings.load_settings()
+    save_dir = settings.get("YOUTUBE_SAVE_DIR")
+    archive_file = str(PROJECT_ROOT / "youtube_history.txt")
+
+    os.makedirs(save_dir, exist_ok=True)
+    print(f"🚀 YouTube高耐久アーカイブ処理を開始します（モード: {mode}）...\n")
     
-    opts = get_ydl_opts()
+    opts = get_ydl_opts(save_dir, archive_file, mode, audio_format)
     
     try:
         with yt_dlp.YoutubeDL(opts) as ydl:
-            ydl.download(TARGET_URLS)
+            ydl.download(urls)
         print("\n🎉 すべての処理が完了しました！")
     except Exception as e:
         print(f"\n⚠️ エラーが発生しました: {e}")
         print("メタデータの埋め込みには FFmpeg が必須です。インストールされているか確認してください。")
 
-if __name__ == "__main__":
-    if not TARGET_URLS or TARGET_URLS[0] == "https://www.youtube.com/watch?v=XXXXXXX":
-        print("⚠️ 設定エリアの TARGET_URLS に実際のYouTube URLを入力してください。")
-    else:
-        run_youtube_downloader()
+# デフォルトのURL（直接編集用）
+TARGET_URLS = [
+    "https://www.youtube.com/shorts/_p9scunEydU",
+]
 
 TARGET_ACCOUNTS = {
     "instagram": [
@@ -93,72 +88,40 @@ TARGET_ACCOUNTS = {
         "0o_momomari_o0",
         "rolaofficial",
     ],
-    "pixiv":[
-        "61218475",         # かのめゆら
-        "107415234",        # unight neko
-        "111230574",        # Tamachi@AIart
-        "117323970",        # めがねの裏側
-        "141282146"         # ICBMLABO
-    ],
-    "twitter": [
-        "AIartezu",
-        "ainovlove8",
-        "AIAVAAI",          # AVA
-        "Ayanong_AIart",
-        "Az_ai_layoutlab",
-        "AzAIprompter",
-        "bubu2kUFO",
-        "cubesteak2",       # さいころ
-        "daredare_ai2",
-        "gfree728",
-        "Giurasu_AIart",
-        "GRAY_AIart",
-        "GRAY_AIartsub",
-        "growupkomari",
-        "Giurasu_AIart",
-        "habeli_ai",        # 侍りbot
-        "hanenoha_ai",
-        "horon_AIart",      # ほるん
-        "h4k4s3_aae",
-        "Iris_ai_Iris",
-        "jsmatsu_44",
-        "KariSeisak71570",  # かっこ
-        "kanome_c",
-        "kanome_yui",
-        "KariSeisak71570",
-        "KHAIWAI567997",
-        "LifelongOrca98",
-        "marume_AIart",
-        "MCagnJP4Oniji",
-        "megamega_aiart",
-        "MotuNikomiAI",
-        "nanowombat02",         # nanowombat
-        "nanowombatSUB",        # nanowombatサブ
-        "natsu_ichino",
-        "nekoneet2",
-        "ousetuaiirasuto",
-        "PeR0pU",
-        "poke066",
-        "Poke0662nd",
-        "poke0663rd",
-        "reve_a_i",
-        "Ringoame8163",         # りんごあめ
-        "rockey2799m",          # Rockey
-        "rit_ai_",
-        "Tatara_AI",
-        "timatanotamati",
-        "tsukishiroalice",
-        "tsumechanai",
-        "Tuxedo_Ham31",
-        "uramega_aiart",        # うらめがねの裏側
-        "uramega_3rd",          # うらめがね3rd
-        "user_kmer7223",        # RADIANT
-        "XX_XX7658",
-        "yo8680307672284",
-        "zhongjoji00000",
-        "zlippers_AIer",
-        "___bcd___",
-        "___dcb___",
-    ]
-    
 }
+
+def get_urls_from_accounts(platform: str) -> list:
+    """アカウント辞書から URL リストを生成する"""
+    accounts = TARGET_ACCOUNTS.get(platform, [])
+    if platform == "instagram":
+        return [f"https://www.instagram.com/{acc}/" for acc in accounts]
+    return []
+
+def main():
+    parser = argparse.ArgumentParser(description="YouTube/SNS Video Downloader (yt-dlp wrapper)")
+    parser.add_argument("urls", nargs="*", help="ダウンロード対象のURL")
+    parser.add_argument("--mode", choices=["video", "audio"], default="video", help="ダウンロードモード")
+    parser.add_argument("--audio-format", default="mp3", help="音声モード時のフォーマット")
+    parser.add_argument("--platform", choices=["instagram"], help="指定したプラットフォームのアカウントリストを一括処理")
+    
+    args = parser.parse_args()
+    
+    # 対象URLの決定
+    target_urls = args.urls if args.urls else []
+    
+    # プラットフォーム指定がある場合はアカウントリストからURLを追加
+    if args.platform:
+        target_urls.extend(get_urls_from_accounts(args.platform))
+    
+    if not target_urls:
+        target_urls = list(TARGET_URLS)
+
+    if not target_urls or (len(target_urls) == 1 and "XXXXXXX" in target_urls[0]):
+        print("⚠️ 対象URLが指定されていないか、デフォルト値のままです。")
+        print("引数でURLを渡すか、スクリプト内の target_urls を編集してください。")
+        return
+
+    run_youtube_downloader(target_urls, mode=args.mode, audio_format=args.audio_format)
+
+if __name__ == "__main__":
+    main()

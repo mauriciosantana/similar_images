@@ -32,7 +32,7 @@ def main() -> None:
         _usage()
         sys.exit(0)
 
-    if sys.argv[1] == "similar":
+    if sys.argv[1] in ("similar", "picker"):
         multiprocessing.freeze_support()
 
     cmd = sys.argv[1]

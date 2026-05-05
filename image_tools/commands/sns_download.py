@@ -16,6 +16,14 @@ try:
 except ImportError:
     msvcrt = None
 
+import zipfile
+import io
+try:
+    from PIL import Image
+    import pillow_avif
+except ImportError:
+    pass
+
 from image_tools.paths import PROJECT_ROOT
 from image_tools import settings as app_settings
 from image_tools.settings import require_setting_str
@@ -40,18 +48,20 @@ FAKE_USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 
 # ダウンロードするメディアの最小サイズ (0の場合は制限なし)
 MIN_MEDIA_WIDTH = 300   
 MIN_MEDIA_HEIGHT = 300  
+MIN_TWITTER_LIKES = 0   # Twitterの最小「いいね」数 (0は無制限)
 
 # プラットフォームごとの設定定義
 PLATFORM_CONFIG = {
     "instagram": {
         "url_template": "https://www.instagram.com/{}/",
         "prefix": "ig",
-        "args": ["--max-downloads", "50", "--user-agent", FAKE_USER_AGENT]
+        "args": ["--max-downloads", "30", "--user-agent", FAKE_USER_AGENT],
+        "sleep": "15-30"
     },
     "pixiv": {
         "url_template": "https://www.pixiv.net/users/{}",
         "prefix": "px",
-        "args": ["-o", "pixiv:ugoira-conv=mp4", "-o", "pixiv:include=illust,manga,ugoira"]
+        "args": ["-o", "pixiv:ugoira-conv=zip", "-o", "pixiv:include=illust,manga,ugoira"]
     },
     "twitter": {
         "url_template": "https://x.com/{}/media",
@@ -201,8 +211,10 @@ def extract_name_from_meta(platform, meta):
         author = meta.get("author") or {}
         body = meta.get("body") or {}
         
-        name = (meta.get("userName") or 
-                (user.get("name") if isinstance(user, dict) else None) or 
+        name = (meta.get("user_name") or 
+                meta.get("userName") or 
+                (user.get("name") if isinstance(user, dict) else user if isinstance(user, str) else None) or 
+                (user.get("userName") if isinstance(user, dict) else None) or
                 (body.get("userName") if isinstance(body, dict) else None) or 
                 (author.get("name") if isinstance(author, dict) else author if isinstance(author, str) else None) or
                 (author.get("nick") if isinstance(author, dict) else None))
@@ -385,6 +397,12 @@ def organize_single_file(media_path, target_json, folder_mapping, account_keywor
     if match:
         prefix = match.group(1).lower()
         raw_account_id = match.group(2)
+        
+        source_tag = None
+        if "#" in raw_account_id:
+            raw_account_id, source_tag = raw_account_id.split("#", 1)
+            filename = filename.replace(f"#{source_tag}", "")
+
         account_key = f"{prefix}_{raw_account_id.lower()}"
         
         hit_keyword = None
@@ -410,6 +428,8 @@ def organize_single_file(media_path, target_json, folder_mapping, account_keywor
             account_folder = PATTERN_INVALID_CHARS.sub('_', account_folder)
         elif account_key in folder_mapping:
             account_folder = folder_mapping[account_key]
+        elif source_tag and f"twtag_{source_tag.lower()}" in folder_mapping:
+            account_folder = folder_mapping[f"twtag_{source_tag.lower()}"]
         else:
             account_folder = f"{prefix}_{raw_account_id}"
             account_folder = PATTERN_INVALID_CHARS.sub('_', account_folder)
@@ -458,6 +478,58 @@ def deep_clean_mp4(file_path):
         print(f"\n❌ [FFmpeg 実行例外] {e}")
         return False
 
+def convert_ugoira_zip_to_avif(zip_path, json_path=None):
+    """PixivのうごイラZIPをアニメーションAVIFに変換する"""
+    try:
+        from PIL import Image
+    except ImportError:
+        return None
+
+    durations = []
+    frames = []
+    ugoira_meta = None
+
+    # メタデータから各フレームの遅延時間を取得
+    if json_path and os.path.exists(json_path):
+        meta = load_cached_json(json_path)
+        if isinstance(meta, list) and len(meta) > 1:
+            ugoira_meta = meta[1].get("ugoira_data")
+        elif isinstance(meta, dict):
+            ugoira_meta = meta.get("ugoira_data")
+
+    try:
+        with zipfile.ZipFile(zip_path, 'r') as z:
+            img_files = [n for n in z.namelist() if n.lower().endswith(('.jpg', '.jpeg', '.png'))]
+            if not img_files: return None
+                
+            if ugoira_meta and "frames" in ugoira_meta:
+                for f_info in ugoira_meta["frames"]:
+                    fname = f_info["file"]
+                    delay = f_info["delay"]
+                    if fname in z.namelist():
+                        with z.open(fname) as f:
+                            frames.append(Image.open(io.BytesIO(f.read())).convert("RGB"))
+                            durations.append(delay)
+            else:
+                # メタデータがない場合は連番ソートして10fpsで作成
+                for name in sorted(img_files):
+                    with z.open(name) as f:
+                        frames.append(Image.open(io.BytesIO(f.read())).convert("RGB"))
+                        durations.append(100)
+        
+        if not frames: return None
+        
+        avif_path = os.path.splitext(zip_path)[0] + ".avif"
+        # アニメーションAVIFとして保存 (qualityは60、ループ設定)
+        frames[0].save(
+            avif_path, save_all=True, append_images=frames[1:],
+            duration=durations, loop=0, quality=60, subsampling="4:4:4"
+        )
+        return avif_path
+    except Exception as e:
+        print(f"\n❌ [うごイラ変換エラー] {os.path.basename(zip_path)}: {e}")
+        return None
+
 def _background_inject(media_path, exiftool_path, folder_mapping, account_keywords, is_final_sweep=False):
     # 渡された文字が何であれ、ファイル名だけを抜き出して強制的に正しい保存先を指定する
     media_path = os.path.join(BASE_SAVE_DIR, os.path.basename(media_path))
@@ -487,6 +559,22 @@ def _background_inject(media_path, exiftool_path, folder_mapping, account_keywor
             break
             
         time.sleep(0.5)
+
+    # ZIPファイル（Pixivうごイラ）の場合はAVIFへの変換を試みる
+    if media_path.lower().endswith(".zip"):
+        new_avif = convert_ugoira_zip_to_avif(media_path, target_json)
+        if new_avif:
+            try:
+                os.remove(media_path)
+                media_path = new_avif
+                base_name = os.path.splitext(os.path.basename(media_path))[0]
+            except: pass
+        else:
+            # 変換対象外または失敗した場合はそのまま整理へ
+            SUCCESS_INJECTED.add(os.path.basename(media_path))
+            if not is_final_sweep:
+                organize_single_file(media_path, target_json, folder_mapping, account_keywords)
+            return
 
     if not target_json or not os.path.exists(media_path):
         if not is_final_sweep:
@@ -571,6 +659,12 @@ def inject_and_organize_files():
         if match:
             prefix = match.group(1).lower()
             raw_account_id = match.group(2)
+            
+            # ハッシュタグ経由のファイルからタグ情報を分離
+            source_tag = None
+            if "#" in raw_account_id:
+                raw_account_id, source_tag = raw_account_id.split("#", 1)
+
             account_key = f"{prefix}_{raw_account_id.lower()}"
             
             hit_keyword = None
@@ -607,9 +701,16 @@ def inject_and_organize_files():
                 account_folder = PATTERN_INVALID_CHARS.sub('_', account_folder)
             elif account_key in folder_mapping:
                 account_folder = folder_mapping[account_key]
+            elif source_tag and f"twtag_{source_tag.lower()}" in folder_mapping:
+                # ユーザーが未登録なら、元のハッシュタグのグループフォルダを使用
+                account_folder = folder_mapping[f"twtag_{source_tag.lower()}"]
             else:
                 account_folder = f"{prefix}_{raw_account_id}"
                 account_folder = PATTERN_INVALID_CHARS.sub('_', account_folder)
+            
+            # ファイル名から一時的なタグ識別子を削除
+            if source_tag:
+                filename = filename.replace(f"#{source_tag}", "")
         
         if filename in SUCCESS_INJECTED:
             base_dst_dir = VIDEO_SAVE_DIR if ext in video_exts else IMAGE_SAVE_DIR
@@ -641,6 +742,10 @@ def inject_and_organize_files():
         if match:
             prefix = match.group(1)
             account_id = match.group(2)
+            
+            if "#" in account_id:
+                account_id = account_id.split("#", 1)[0]
+
             platform_map = {"tw": "twitter", "twtag": "twitter_hashtag", "ig": "instagram", "px": "pixiv"}
             pf = platform_map.get(prefix)
             if pf:
@@ -683,7 +788,7 @@ def inject_and_organize_files():
 # --------------------------------------------------------
 # ★ ダウンロード実行処理
 # --------------------------------------------------------
-def download_account(platform, account, config, completed_accounts, bg_executor, folder_mapping, account_keywords, keywords=None):
+def download_account(platform, account, config, completed_accounts, bg_executor, folder_mapping, account_keywords, keywords=None, min_likes=0):
     identifier = f"{platform}:{account}"
     url = config["url_template"].format(account)
     prefix = config["prefix"]
@@ -693,10 +798,18 @@ def download_account(platform, account, config, completed_accounts, bg_executor,
     
     print(f"{'='*80}")
     
+    # ファイル名テンプレートの構築
+    # ハッシュタグの場合は 'tw_{投稿者ID}#{タグ名}' にすることで整理時に追跡可能にする
+    fn_prefix = prefix
+    fn_account = account
+    if platform == "twitter_hashtag":
+        fn_prefix = "tw"
+        fn_account = "{author[nick]}#" + account
+
     command = [
         "gallery-dl", "--cookies", COOKIES_FILE, "--download-archive", ARCHIVE_FILE,
         "--sleep", "4-6", "--sleep-request", "4-6", "-d", BASE_SAVE_DIR,       
-        "-o", "directory=.", "-o", f"filename={prefix}_{account}_{{date:%Y%m%d_%H%M%S}}_{{id}}_{{num}}.{{extension}}",
+        "-o", "directory=.", "-o", f"filename={fn_prefix}_{fn_account}_{{date:%Y%m%d_%H%M%S}}_{{id}}_{{num}}.{{extension}}",
         "--write-metadata", "--exec", "cmd /c echo GAL_DL_SUCCESS:::{}"
     ]
     command.extend(config["args"])
@@ -708,6 +821,10 @@ def download_account(platform, account, config, completed_accounts, bg_executor,
     if MIN_MEDIA_HEIGHT > 0:
         filter_exprs.append(f"(not height or height >= {MIN_MEDIA_HEIGHT})")
 
+    # Twitterの「いいね」数フィルタを追加
+    if platform.startswith("twitter") and min_likes > 0:
+        filter_exprs.append(f"(favorite_count >= {min_likes})")
+
     if platform.startswith("twitter") and keywords:
         conditions = [f"('{kw.replace('\'', '\\\'')}' in str(content))" for kw in keywords]
         filter_exprs.append(f"(content and ({' or '.join(conditions)}))")
@@ -716,8 +833,11 @@ def download_account(platform, account, config, completed_accounts, bg_executor,
         combined_filter = " and ".join(filter_exprs)
         command.extend(["--filter", combined_filter])
         
-        if platform.startswith("twitter") and keywords:
-            print(f"🔍 [フィルタ有効] キーワード: {', '.join(keywords)} ")
+        if platform.startswith("twitter"):
+            if keywords:
+                print(f"🔍 [フィルタ有効] キーワード: {', '.join(keywords)} ")
+            if min_likes > 0:
+                print(f"🔍 [フィルタ有効] 最小いいね数: {min_likes} ")
 
     if identifier in completed_accounts:
         print(f"🚀 [{platform}] {display_name} (高速差分モード)")
@@ -740,7 +860,7 @@ def download_account(platform, account, config, completed_accounts, bg_executor,
             errors="replace",
             cwd=str(PROJECT_ROOT),
         )
-        print(f"⏳ 処理を開始しました... (中断して完了扱いにするには 's' キー)", end="", flush=True)
+        print(f"⏳ 処理を開始しました... (中断して完了扱いにするには 's' キー)")
         
         # 標準出力を非ブロッキングで読み込むためのキューとスレッド
         line_queue = queue.Queue()
@@ -757,7 +877,8 @@ def download_account(platform, account, config, completed_accounts, bg_executor,
             # キー入力の監視 ('s'キーで中断し、完了済みとしてマーク)
             if msvcrt and msvcrt.kbhit():
                 if msvcrt.getch().decode('utf-8', errors='ignore').lower() == 's':
-                    print(f"\n⏩ [手動完了] {display_name} の処理を中断し、完了済みとして記録します...")
+                    msg = "中断し、完了済みとして記録します..."
+                    print(f"\r{' ' * 80}\r⏩ [手動完了] {display_name} の処理を{msg}")
                     process.terminate()
                     process.wait()
                     mark_as_completed(identifier)
@@ -778,7 +899,7 @@ def download_account(platform, account, config, completed_accounts, bg_executor,
             
             if "[error]" in lower_line or "exception" in lower_line:
                 err_count += 1
-                print(f"\n❌ エラー詳細: {line}")
+                print(f"\r{' ' * 80}\r❌ エラー詳細: {line}")
                 if "challenge" in lower_line or "400 bad request" in lower_line:
                     is_critical_error = True
                     print(f"🚨 [警告] セキュリティロック(Challenge)または不正なリクエストを検知しました。")
@@ -838,7 +959,7 @@ def download_account(platform, account, config, completed_accounts, bg_executor,
         FAST_EXIFTOOL.stop() # 終了時に常駐プロセスも安全に切断
         sys.exit(0)
 
-def run_downloader(do_organize=True, platforms=None):
+def run_downloader(do_organize=True, platforms=None, min_likes=0):
     require_setting_str("BASE_SAVE_DIR")
     completed_accounts = load_completed_list()
     targets = load_targets()
@@ -867,11 +988,14 @@ def run_downloader(do_organize=True, platforms=None):
                 for target_info in accounts:
                     account = target_info["id"]
                     keywords = target_info["keywords"]
-                    is_critical = download_account(platform, account, config, completed_accounts, bg_executor, folder_mapping, account_keywords, keywords)
+                    is_critical = download_account(platform, account, config, completed_accounts, bg_executor, folder_mapping, account_keywords, keywords, min_likes=min_likes)
                     if is_critical:
                         print(f"\n🚨 安全のため、{platform} の残りのアカウントをスキップします。\n")
                         break
-                    time.sleep(10)
+                    
+                    # アカウント間の待機時間をプラットフォームごとに調整
+                    acc_sleep = 60 if platform == "instagram" else 10
+                    time.sleep(acc_sleep)
 
     finally:
         print(f"\n{'='*100}")
@@ -891,6 +1015,7 @@ def main():
     parser.add_argument("-i", "--instagram", action="store_true", help="Instagramを対象にする")
     parser.add_argument("-tg", "--hashtag", action="store_true", help="Twitterハッシュタグを対象にする")
     parser.add_argument("--skip-organize", action="store_true", help="ダウンロード後のファイル整理をスキップする")
+    parser.add_argument("--min-likes", type=int, default=MIN_TWITTER_LIKES, help="Twitterの最小「いいね」数")
     
     args = parser.parse_args()
     
@@ -904,7 +1029,7 @@ def main():
     if not selected_platforms:
         selected_platforms = ["pixiv", "twitter"]
         
-    run_downloader(do_organize=not args.skip_organize, platforms=selected_platforms)
+    run_downloader(do_organize=not args.skip_organize, platforms=selected_platforms, min_likes=args.min_likes)
 
 if __name__ == "__main__":
     main()

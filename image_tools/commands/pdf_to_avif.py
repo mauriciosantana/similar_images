@@ -43,7 +43,25 @@ def convert_pdf_to_avif(pdf_path: Path, output_dir: Path, dpi: int, quality: int
             pix = page.get_pixmap(matrix=mat)
             img = Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
             output_file = target_folder / f"{folder_name}_{i + 1:03d}.avif"
-            img.save(output_file, "AVIF", quality=quality)
+            try:
+                # まずは高品質な 4:4:4 で試行
+                img.save(output_file, "AVIF", quality=quality, subsampling="4:4:4")
+            except (Exception, MemoryError) as e:
+                err_msg = str(e).lower()
+                if isinstance(e, MemoryError) or "color planes" in err_msg or "out of memory" in err_msg or "yuv failed" in err_msg:
+                    # 品質維持のためのリトライ: サイズを偶数にする
+                    w, h = img.size
+                    if w % 2 != 0 or h % 2 != 0:
+                        img = img.resize((w + (w % 2), h + (h % 2)), resample=Image.NEAREST)
+                    
+                    try:
+                        # タイリングを有効にして再試行
+                        img.save(output_file, "AVIF", quality=quality, subsampling="4:4:4", tile_rows=1, tile_cols=1)
+                    except:
+                        # どうしてもダメな場合のみ 4:2:0
+                        img.save(output_file, "AVIF", quality=quality, subsampling="4:2:0")
+                else:
+                    raise e
 
         doc.close()
         return f"完了: {pdf_path.name}"

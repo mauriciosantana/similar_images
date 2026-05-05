@@ -14,7 +14,8 @@ def usage_text() -> str:
         "  python -m image_tools <command> [オプション...]\n"
         "（プロジェクトフォルダで実行）\n\n"
         "コマンド一覧:\n"
-        "  similar          類似画像チェッカー\n"
+        "  similar          類似画像チェッカー (-m p で選別, -P で継続選別, -E でサブフォルダごと)\n"
+        "  picker           画像選別システム (similar -m p の短縮コマンド)\n"
         "  sns              SNS メディア一括ダウンロード (gallery-dl)\n"
         "  optimizer        画像・圧縮ファイル最適化\n"
         "  teketou          SNS画像フォルダの手動整理\n"
@@ -38,6 +39,15 @@ def _run_similar() -> None:
     run()
 
 
+def _run_picker() -> None:
+    from image_tools.commands.similar import main as run
+    import sys
+    # picker コマンドとして呼ばれた場合、内部的に similar の picker モードとして引数を偽装する
+    sys.argv.insert(1, "-m")
+    sys.argv.insert(2, "p")
+    run()
+
+
 def _run_optimizer() -> None:
     from image_tools.commands.optimizer import main as run
 
@@ -57,18 +67,9 @@ def _run_inject() -> None:
 
 
 def _run_youtube() -> None:
-    from image_tools.commands.youtube import TARGET_URLS, run_youtube_downloader
+    from image_tools.commands.youtube import main as run
 
-    if not TARGET_URLS or (
-        len(TARGET_URLS) == 1
-        and (
-            "XXXXXXX" in TARGET_URLS[0]
-            or "watch?v=XXXXXXX" in TARGET_URLS[0]
-        )
-    ):
-        print("⚠️ image_tools/commands/youtube.py の TARGET_URLS に実際の URL を設定してください。")
-    else:
-        run_youtube_downloader()
+    run()
 
 
 def _run_convert_json() -> None:
@@ -96,6 +97,7 @@ def _run_sns() -> None:
 
 _COMMAND_HANDLERS: dict[str, Callable[[], None]] = {
     "similar": _run_similar,
+    "picker": _run_picker,
     "optimizer": _run_optimizer,
     "teketou": _run_teketou,
     "inject": _run_inject,
