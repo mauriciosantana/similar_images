@@ -666,7 +666,7 @@ def process_directory(current_path, executor, args, pbar_global, db_cache=None, 
 # ---------------------------------------------------------
 def main():
     parser = argparse.ArgumentParser(description="Image & Archive Optimizer Script V4.2")
-    parser.add_argument("root_dir", type=str, help="Target root directory path")
+    parser.add_argument("root_dir", type=str, nargs="?", help="Target root directory path")
     parser.add_argument("--zip", action="store_true", help="Pack folders into uncompressed zip after processing")
     parser.add_argument("-g", "--grayscale", type=int, nargs="?", const=-1, help="Convert to grayscale. If a number is specified (e.g., -g 16), only images with color counts below that threshold are converted.")
     parser.add_argument("--align", action="store_true", help="Unify image dimensions to the maximum found in each folder")
@@ -692,7 +692,9 @@ def main():
         CONFIG['IMAGE_EXTS'] = CONFIG['IMAGE_EXTS'].union(new_targets)
 
     set_low_priority()
-    target_root = Path(args.root_dir).resolve()
+    
+    root_dir_str = args.root_dir or r"E:\man 漫画\sho 書籍\bla\optimize"
+    target_root = Path(root_dir_str).resolve()
     
     config = load_config() # config.json を読み込む
     exclude_dir_names = set()

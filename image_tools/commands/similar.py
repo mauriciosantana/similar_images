@@ -116,6 +116,22 @@ def normalize_selection_command(ans: str) -> NormalizedSelectionCommand:
     return NormalizedSelectionCommand(is_protect=is_protect, is_all_at=is_all_at, body=s)
 
 
+def is_excluded_path(p_str: str, exclude_names: set[str], exclude_abs_paths: list[str]) -> bool:
+    """パス文字列が除外設定に含まれているか判定"""
+    p_norm = p_str.replace('\\', '/')
+    # 1. 絶対パスの接頭辞によるチェック
+    for ex_p in exclude_abs_paths:
+        ex_p_norm = ex_p.replace('\\', '/')
+        if p_norm.startswith(ex_p_norm):
+            if len(p_norm) == len(ex_p_norm) or p_norm[len(ex_p_norm)] == '/':
+                return True
+    # 2. フォルダ名によるチェック
+    for part in p_norm.split('/'):
+        if part in exclude_names:
+            return True
+    return False
+
+
 def compute_selection_indices(cmd: NormalizedSelectionCommand, file_names: list[str]) -> SelectionResult:
     """
     残すインデックス・＠対象・ステータス文言を決定（GUI 非依存の純粋処理）。
@@ -339,14 +355,17 @@ class ImageManagerApp(tk.Tk): # Renamed from SimilarImageApp
         self.thumbnail_executor = ThreadPoolExecutor(max_workers=4)
         self.exit_requested = False
         self.thumbnail_cache = {}
+        self.quit_entire_script = False # New flag to indicate if the entire script should terminate
+        self.skip_apply = False # Flag to skip applying actions for the current folder
         self.cache_lock = threading.Lock()
         self.confirm_delete_all = False
         self.immediate_delete = True
         
         self.title("類似画像チェッカー")
         try:
-            self.state('zoomed')
+            self.state('zoomed') # Maximize window on Windows
         except:
+            # Fallback for other OS or if 'zoomed' state is not supported
             w, h = self.winfo_screenwidth(), self.winfo_screenheight()
             self.geometry(f"{w}x{h}+0+0")
             
@@ -357,9 +376,10 @@ class ImageManagerApp(tk.Tk): # Renamed from SimilarImageApp
         self.show_current_group()
 
     def quit(self):
+        self.exit_requested = True # Mark that this GUI instance is closing
         self.thumbnail_executor.shutdown(wait=False)
         self.destroy()
-        super().quit()
+        # Do NOT call super().quit() here; self.destroy() is enough to end mainloop
 
     def _setup_ui(self):
         self.main_frame = ttk.Frame(self)
@@ -375,7 +395,7 @@ class ImageManagerApp(tk.Tk): # Renamed from SimilarImageApp
         self.status_label.pack(side=tk.TOP, pady=2)
 
         # Unified guide text for both modes
-        self.guide_label = ttk.Label(self.bottom_frame, text="【入力例】a 全残す / d 全削除 / b 戻る / s 途中保存 / m 移動 / t 即時削除 / q フォルダ終了 / w 全体終了", font=("Meiryo", 11))
+        self.guide_label = ttk.Label(self.bottom_frame, text="【入力例】a 全残す / d 全削除 / b 戻る / s 判定保存 / m 移動 / t 即時削除 / q フォルダスキップ / w 全体終了", font=("Meiryo", 11))
         self.guide_label.pack(side=tk.TOP, pady=2)
 
         self.entry_var = tk.StringVar()
@@ -637,14 +657,15 @@ class ImageManagerApp(tk.Tk): # Renamed from SimilarImageApp
 
     def _apply_command(self, ans):
         if ans == 'w':
-            print("🛑 プログラム全体を終了します。これまでの判定を反映して終了します。")
-            self.exit_requested = True
+            print("🛑 プログラム全体を終了します。これまでの判定を反映します。")
+            self.quit_entire_script = True
             self.quit()
             return
 
         ans = ans.lower()
         if ans == 'q':
-            print("🛑 処理を中断します。これまでの判定を反映して終了します。")
+            print("🛑 現在のフォルダをスキップし、次のフォルダへ進みます（未保存の判定は破棄されます）。")
+            self.skip_apply = True
             self.quit()
             return
             
@@ -714,6 +735,10 @@ class ImageManagerApp(tk.Tk): # Renamed from SimilarImageApp
         self.show_current_group()
 
     def apply_pending_actions(self):
+        if self.skip_apply:
+            print("ℹ️ スキップが選択されたため、このフォルダの未保存の判定は反映されません。")
+            return
+
         if not self.c or not self.conn or not self.args:
             return
 
@@ -790,9 +815,7 @@ class ImageManagerApp(tk.Tk): # Renamed from SimilarImageApp
 # フェーズ分割された関数群
 # ==========================================
 def scan_and_sync_files(args, config, conn, c, needs_scan, target_dirs_paths, today_str):
-    image_infos = []
-    
-    # --- 除外設定の準備 ---
+    """DBとファイルシステムの同期を行い、有効な画像情報のリストを返す"""
     exclude_names = set(config.get("EXCLUDE_DIR_NAMES", []))
     exclude_abs_paths = []
     for d in config.get("EXCLUDE_DIR_NAMES", []):
@@ -800,21 +823,11 @@ def scan_and_sync_files(args, config, conn, c, needs_scan, target_dirs_paths, to
             p = Path(d).resolve()
             exclude_abs_paths.append(str(p))
         except: pass
-    
-    def is_excluded_path(p_str):
-        """パス文字列が除外設定に含まれているか判定（高速版）"""
-        p_norm = p_str.replace('\\', '/')
-        # 2. 絶対パスの接頭辞によるチェック
-        for ex_p in exclude_abs_paths:
-            ex_p_norm = ex_p.replace('\\', '/')
-            if p_norm.startswith(ex_p_norm):
-                if len(p_norm) == len(ex_p_norm) or p_norm[len(ex_p_norm)] == '/':
-                    return True
-        # 1. フォルダ名によるチェック
-        for part in p_norm.split('/'):
-            if part in exclude_names:
-                return True
-        return False
+
+    def _is_ex(p):
+        return is_excluded_path(p, exclude_names, exclude_abs_paths)
+
+    image_infos = []
 
     if not needs_scan:
         print("⏭️ ファイルスキャンをスキップし、既存のデータベースから読み込みます（-f で再スキャン可能）。")
@@ -823,8 +836,7 @@ def scan_and_sync_files(args, config, conn, c, needs_scan, target_dirs_paths, to
         print(f"🗄️ データベースから {len(db_rows)} 件の画像情報を読み込み中...")
         for r in db_rows:
             p_str = r[0]
-            # DB読み込み時にも除外フィルタを適用
-            if not is_excluded_path(p_str):
+            if not _is_ex(p_str):
                 image_infos.append({'path': p_str, 'hash_str': r[1], 'color_hash_str': r[2], 'pixels': r[3], 'filesize': r[4], 'aspect_ratio': r[5]})
         print("  ✅ 読み込み完了")
         return image_infos
@@ -850,7 +862,7 @@ def scan_and_sync_files(args, config, conn, c, needs_scan, target_dirs_paths, to
         if not t_dir.is_dir(): continue
         for root, dirs, files in os.walk(str(t_dir)):
             # 除外設定にあるディレクトリは枝切り（スキップ）して高速化する
-            dirs[:] = [d for d in dirs if d not in exclude_names and not is_excluded_path(os.path.join(root, d))]
+            dirs[:] = [d for d in dirs if d not in exclude_names and not _is_ex(os.path.join(root, d))]
             
             root_str = root
             try:
@@ -921,8 +933,7 @@ def scan_and_sync_files(args, config, conn, c, needs_scan, target_dirs_paths, to
             for path_str, res in tqdm(results, total=len(args_list), desc="⏳ 画像解析"):
                 if res:
                     batch.append((*res, 0))
-                    # 解析は行うが、除外フォルダ内の場合は image_infos には入れない
-                    if not is_excluded_path(path_str):
+                    if not _is_ex(path_str):
                         image_infos.append({'path': path_str, 'hash_str': res[1], 'color_hash_str': res[2], 'pixels': res[3], 'filesize': res[4], 'aspect_ratio': res[5]})
                 else:
                     delete_db_records(c, [path_str])
@@ -1047,6 +1058,128 @@ def find_similar_groups(image_infos, args, config, c, conn):
     return valid_groups
 
 
+def get_sub_targets(args, target_dirs_paths):
+    """処理対象とするサブディレクトリのリストを取得する"""
+    if not args.each:
+        return target_dirs_paths
+    
+    sub_targets = []
+    for d in target_dirs_paths:
+        dirs = [Path(e.path) for e in os.scandir(d) if e.is_dir()]
+        sub_targets.extend(sorted(dirs))
+    return sub_targets
+
+
+def run_image_manager_gui(groups, image_infos, args, c, conn, mode=None, num_per_page=None):
+    """GUIを起動し、結果を適用する共通ラッパー"""
+    app = ImageManagerApp(
+        groups, image_infos, 
+        auto_mode=args.auto, args=args, c=c, conn=conn, 
+        mode=mode, num_per_page=num_per_page
+    )
+    app.mainloop()
+    app.apply_pending_actions()
+    return app
+
+
+def execute_picker_workflow(current_all_infos, args, c, conn, target_prefix):
+    """Pickerモードの一連の処理（選別・移動）を実行する"""
+    # 保護済み画像 (_protect) を抽出
+    protected_paths = [info['path'] for info in current_all_infos if contains_protect_marker(Path(info["path"]).name)]
+    picker_infos = [info for info in current_all_infos if not contains_protect_marker(Path(info["path"]).name)]
+    
+    # 拡張子フィルタリング
+    if args.ext:
+        target_exts = {("." + e.lower().lstrip(".")) for e in args.ext}
+        picker_infos = [info for info in picker_infos if Path(info["path"]).suffix.lower() in target_exts]
+        protected_paths = [p for p in protected_paths if Path(p).suffix.lower() in target_exts]
+
+    folder_kept_paths = set(protected_paths)
+
+    if picker_infos:
+        if args.sort_size:
+            picker_infos.sort(key=lambda x: x['filesize'], reverse=True)
+        else:
+            picker_infos.sort(key=lambda x: x['path'])
+
+        groups = [list(range(i, min(i + args.num, len(picker_infos)))) for i in range(0, len(picker_infos), args.num)]
+        print(f"🚀 選別開始: {len(picker_infos)} 枚 ({len(groups)} ページ)")
+
+        app = run_image_manager_gui(groups, picker_infos, args, c, conn, mode="picker", num_per_page=args.num)
+        
+        if app.quit_entire_script:
+            return True # スクリプト全体終了フラグ
+
+        # GUIが閉じられた際、明示的に削除(d/0)を選択しなかった未処理分（現在のページ以降）を
+        # 全て「維持」および「移動」の対象として確実にマークする
+        for i in range(app.current_idx, len(app.groups)):
+            for info_idx in app.groups[i]:
+                p_str = app.image_infos[info_idx]['path']
+                if not any(p_str in t_list for t_list in app.trash_actions.values()):
+                    app.final_kept_paths.add(p_str)
+        
+        if not app.skip_apply:
+            folder_kept_paths.update(app.final_kept_paths)
+
+    # 個別ファイルの移動処理
+    if args.move and not getattr(app, 'skip_apply', False):
+        move_kept_files(folder_kept_paths, args, c, conn)
+    
+    return False
+
+
+def move_kept_files(folder_kept_paths, args, c, conn):
+    """選別で残ったファイルを指定の移動先へ送る"""
+    import image_tools.settings as app_settings
+    s = app_settings.load_settings()
+    dest = s.get("PICKER_MOVE_DEST")
+    if not dest or not folder_kept_paths:
+        return
+
+    base_save = s.get("BASE_SAVE_DIR")
+    dest_root = Path(dest)
+    
+    config = load_config()
+    target_dirs_paths = [Path(d).resolve() for d in config["TARGET_DIRS"] if d.strip()]
+
+    for p_str in list(folder_kept_paths):
+        src_p = Path(p_str).resolve()
+        if not src_p.exists():
+            continue
+
+        # src_p が TARGET_DIRS のいずれかの配下にあるかチェック
+        found_root = None
+        for d in target_dirs_paths:
+            try:
+                src_p.relative_to(d) # src_pがdの配下にあるかチェック
+                found_root = d
+                break
+            except ValueError:
+                continue
+
+        if not found_root:
+            print(f"  ⏭️ 移動スキップ(対象ルートフォルダ外): {src_p.name}")
+            continue
+        
+        # 移動先のパスを構築: PICKER_MOVE_DEST / 直上のフォルダ名 / ファイル名
+        target_p = dest_root / src_p.parent.name / src_p.name
+
+        if target_p.exists():
+            print(f"  ℹ️ 移動スキップ(既に存在): {src_p.name} -> {target_p}")
+            continue
+
+        target_p.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            shutil.move(str(src_p), str(target_p))
+            new_p_str = str(target_p.resolve())
+            c.execute("UPDATE images SET path = ? WHERE path = ?", (new_p_str, p_str))
+            print(f"  ✅ 移動成功: {src_p.name} -> {target_p}")
+        except Exception as e:
+            print(f"  ❌ 移動失敗: {src_p.name} -> {e}")
+
+    conn.commit()
+
+
 # ==========================================
 # メインプロセス
 # ==========================================
@@ -1073,7 +1206,6 @@ def setup_path():
         sys.path.insert(0, _current_dir)
 
 def main():
-    app = None  # 初期化して UnboundLocalError を防止
     setup_path()
     parser = argparse.ArgumentParser(description="画像整理スクリプト (類似画像検出 / 順次選別)")
     parser.add_argument("-m", "--mode", choices=["similar", "picker", "s", "p"], default="similar",
@@ -1151,18 +1283,13 @@ def main():
     if args.mode.lower().startswith("s"):
         image_infos = process_exact_matches(image_infos, args, c, conn)
 
-    # --- フェーズ0: [-E] 指定時の全体類似画像検索 ---
-    # -E実行時、まずは全フォルダを横断して類似グループを探し、
-    # その後各サブフォルダを順次picker(選別)モードで処理するように振る舞いを変更する
     if args.each and args.mode.lower().startswith("s"):
         print(f"\n🌲 【STEP 2-E】全体での類似画像検索を開始します...")
         global_groups = find_similar_groups(image_infos, args, config, c, conn)
         if global_groups:
             print(f"🔍 全体で {len(global_groups)} 個の類似グループが見つかりました。")
-            app = ImageManagerApp(global_groups, image_infos, auto_mode=args.auto, args=args, c=c, conn=conn)
-            app.mainloop()
-            app.apply_pending_actions()
-            if app.exit_requested:
+            app = run_image_manager_gui(global_groups, image_infos, args, c, conn)
+            if app.quit_entire_script: # Check for full script exit
                 conn.close()
                 sys.exit(0)
             
@@ -1179,15 +1306,8 @@ def main():
         # 全体検索が終わったので、以降の各フォルダ処理は選別(picker)に切り替える
         args.mode = "picker"
 
-    # --- 処理対象フォルダの決定 ---
-    sub_targets = []
-    if args.each:
-        for d in target_dirs_paths:
-            dirs = [Path(e.path) for e in os.scandir(d) if e.is_dir()]
-            sub_targets.extend(sorted(dirs))
-        print(f"📁 {len(sub_targets)} 個のサブフォルダを順次処理します。")
-    else:
-        sub_targets = target_dirs_paths
+    sub_targets = get_sub_targets(args, target_dirs_paths)
+    if args.each: print(f"📁 {len(sub_targets)} 個のサブフォルダを順次処理します。")
 
     # --- フォルダごとのメインループ ---
     for current_target in sub_targets:
@@ -1212,11 +1332,10 @@ def main():
 
             if groups:
                 print(f"🔍 類似グループ: {len(groups)} 個")
-                app = ImageManagerApp(groups, current_all_infos, auto_mode=args.auto, args=args, c=c, conn=conn)
-                app.mainloop()
-                app.apply_pending_actions()
-                if app and app.exit_requested:
+                app = run_image_manager_gui(groups, current_all_infos, args, c, conn)
+                if app.quit_entire_script:
                     break
+                if app.skip_apply: continue
             elif len(current_all_infos) < 2:
                 print("ℹ️ 類似判定に必要な枚数がありません。")
             else:
@@ -1232,82 +1351,37 @@ def main():
                     for r in rows if r[0].startswith(target_prefix)
                 ]
                 current_mode = "picker"
-                if app and app.exit_requested:
-                    break
-            else:
-                # 継続しない場合は、個別移動が必要ならここで（通常は -E なしの時にまとめて行う）
-                pass
 
         # --- フェーズ2: 順次選別 (Picker) ---
         if current_mode.startswith("p"):
-            # 保護済み画像 (_protect) を除外
-            current_all_infos = [info for info in current_all_infos if not contains_protect_marker(Path(info["path"]).name)]
-            
-            # 拡張子フィルタリング
-            if args.ext:
-                target_exts = {("." + e.lower().lstrip(".")) for e in args.ext}
-                current_all_infos = [info for info in current_all_infos if Path(info["path"]).suffix.lower() in target_exts]
+            is_quit = execute_picker_workflow(current_all_infos, args, c, conn, target_prefix)
+            if is_quit: break
 
-            if current_all_infos:
-                # ソート
-                if args.sort_size:
-                    current_all_infos.sort(key=lambda x: x['filesize'], reverse=True)
-                else:
-                    current_all_infos.sort(key=lambda x: x['path'])
-
-                # チャンク分け
-                groups = [list(range(i, min(i + args.num, len(current_all_infos)))) for i in range(0, len(current_all_infos), args.num)]
-                print(f"🚀 選別開始: {len(current_all_infos)} 枚 ({len(groups)} ページ)")
-
-                app = ImageManagerApp(groups, current_all_infos, args=args, c=c, conn=conn, mode="picker", num_per_page=args.num)
-                app.mainloop()
-                app.apply_pending_actions()
-                if app and app.exit_requested:
-                    break
-
-                # 個別ファイルの移動処理 (Picker)
-                if args.move:
-                    import image_tools.settings as app_settings
-                    s = app_settings.load_settings()
-                    dest = s.get("PICKER_MOVE_DEST")
-                    if dest and app.final_kept_paths:
-                        dest_root = Path(dest)
-                        for p_str in list(app.final_kept_paths):
-                            src_p = Path(p_str)
-                            if not src_p.exists(): continue
-                            found_root = None
-                            for d in target_dirs_paths:
-                                try: src_p.relative_to(d); found_root = d; break
-                                except ValueError: continue
-                            if not found_root: continue
-                            target_p = dest_root / found_root.name / src_p.relative_to(found_root)
-                            if target_p.exists(): continue
-                            target_p.parent.mkdir(parents=True, exist_ok=True)
-                            try:
-                                shutil.move(str(src_p), str(target_p))
-                                new_p_str = str(target_p.resolve())
-                                c.execute("UPDATE images SET path = ? WHERE path = ?", (new_p_str, p_str))
-                                c.execute("UPDATE similarity_edges SET path1 = ? WHERE path1 = ?", (new_p_str, p_str))
-                                c.execute("UPDATE similarity_edges SET path2 = ? WHERE path2 = ?", (new_p_str, p_str))
-                                c.execute("DELETE FROM folder_mtimes WHERE path IN (?, ?)", (str(src_p.parent.resolve()), str(target_p.parent.resolve())))
-                            except: pass
-                        conn.commit()
-
-        # フォルダ単位の処理が終わるごとに、空フォルダをクリーンアップ
         cleanup_empty_folders(current_target, delete_root=args.each)
-
-        if app and getattr(app, 'exit_requested', False):
-            break
 
     # --- 全処理終了後のフォルダ移動 (Similar単体で -E なしの場合の互換用) ---
     if not args.each and args.mode.startswith("s") and not args.then_picker and args.move:
         import image_tools.settings as app_settings
         s = app_settings.load_settings()
         dest = s.get("PICKER_MOVE_DEST")
+        
+        # 移動制限用のパスを特定
+        base_save = s.get("BASE_SAVE_DIR")
+        restrict_path = Path(base_save).resolve() / "SNS画像" if base_save else None
+
         if dest:
             dest_path = Path(dest)
             for d in target_dirs_paths:
-                if not d.exists() or not d.is_dir(): continue
+                d_resolved = d.resolve()
+                if not d_resolved.exists() or not d_resolved.is_dir(): continue
+                
+                # 特定のディレクトリ配下のみ移動対象とする
+                if restrict_path:
+                    try:
+                        d_resolved.relative_to(restrict_path)
+                    except ValueError:
+                        continue # 移動対象外（フォルダごと維持）
+
                 target_dest = dest_path / d.name
                 if target_dest.exists(): continue
                 try:
