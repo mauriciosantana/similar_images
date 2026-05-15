@@ -2,6 +2,8 @@ import os
 import glob
 import subprocess
 
+from image_tools.utils.exiftool_wrapper import FastExifTool
+from image_tools.utils.media_utils import deep_clean_mp4
 from image_tools import settings as app_settings
 from image_tools.settings import require_setting_str
 
@@ -63,41 +65,6 @@ def is_match(base_name, file_name):
     if next_char_idx < len(file_name):
         if file_name[next_char_idx].isalnum(): return False 
     return True
-
-def deep_clean_mp4(file_path):
-    """
-    FFmpegを使用して、Terminator警告の原因となる壊れたメタデータ領域を
-    物理的に一度削除し、クリーンなコンテナを作成する
-    """
-    if not file_path.lower().endswith(".mp4"):
-        return True
-    
-    temp_path = file_path + ".clean.mp4"
-    
-    # -map_metadata -1: 既存の全メタデータを破棄
-    # -fflags +bitexact: 余計な識別子を入れない
-    # -movflags +faststart: 構造を最適化
-    conv_cmd = [
-        "ffmpeg", "-i", file_path,
-        "-c", "copy",
-        "-map_metadata", "-1",
-        "-fflags", "+bitexact",
-        "-movflags", "+faststart",
-        "-y", temp_path
-    ]
-    
-    try:
-        result = subprocess.run(conv_cmd, capture_output=True, text=True)
-        if result.returncode == 0 and os.path.exists(temp_path):
-            os.replace(temp_path, file_path)
-            return True
-        else:
-            print(f"\n[FFmpeg Clean Fail] {os.path.basename(file_path)}")
-            if os.path.exists(temp_path): os.remove(temp_path)
-            return False
-    except Exception as e:
-        print(f"\n[FFmpeg Exception] {e}")
-        return False
 
 def inject_and_cleanup():
     print(f"💉 強制クリーンアップ注入モードを開始します...\n")

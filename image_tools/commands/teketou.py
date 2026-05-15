@@ -1,8 +1,10 @@
 import os
 import shutil
 import re
+import logging
 
 from image_tools import settings as app_settings
+from image_tools.utils.media_utils import PATTERN_FILENAME_1, PATTERN_FILENAME_2, PATTERN_INVALID_CHARS, PATTERN_TARGET_COMMENT, MEDIA_EXTS
 from image_tools.settings import require_setting_str
 
 _S = app_settings.load_settings()
@@ -10,15 +12,14 @@ TARGET_DIR = _S.get("TEKETOU_TARGET_DIR") or ""
 TARGETS_FILE = _S.get("TEKETOU_TARGETS_FILE") or ""
 
 # ＝＝＝ 処理対象の拡張子 ＝＝＝
-MEDIA_EXTS = {
-    # 動画
-    ".mp4", ".mov", ".webm", ".avi", ".mkv", ".m4v",
-    # 画像
-    ".jpg", ".jpeg", ".png", ".gif", ".webp", ".avif", ".bmp"
-}
+logger = logging.getLogger(__name__)
 
 def get_folder_mapping(targets_file):
     """targets.txtのコメントと連続したアカウント群からフォルダ名を生成する"""
+    def read_text_file(filepath):
+        with open(filepath, "r", encoding="utf-8-sig") as f:
+            return f.readlines()
+
     mapping = {}
     if not os.path.exists(targets_file):
         return mapping
@@ -44,7 +45,7 @@ def get_folder_mapping(targets_file):
             if temp_group:
                 groups.append((temp_comment, temp_group))
                 temp_group = []
-            c = line.lstrip("#").strip()
+            c = line.lstrip("#").strip() # コメント行から # を除去
             # 「#twitter:xxx」のような無効化されたアカウント指定は名前として拾わない
             if re.match(r"^(twitter|instagram|pixiv|twtag)\s*:", c, re.IGNORECASE):
                 continue
@@ -81,7 +82,7 @@ def get_folder_mapping(targets_file):
             
         # アカウントIDは入れず、コメント名だけのフォルダ名にする
         folder_name = comment
-        folder_name = re.sub(r'[\\/:*?"<>|]', '_', folder_name)
+        folder_name = PATTERN_INVALID_CHARS.sub('_', folder_name)
         
         for account_key in group:
             mapping[account_key] = folder_name
@@ -116,11 +117,9 @@ def organize_media_files(target_dir):
             account_folder = None
             
             # 命名規則からプラットフォームとアカウントIDを抽出
-            match = re.search(r"^(tw|twtag|ig|px)_(.+?)_\d{8}_\d{6}_", item)
+            match = PATTERN_FILENAME_1.search(item)
             if not match:
-                # 日付時刻が含まれない形式 (アンダーバーを含むIDに対応)
-                match = re.search(r"^(tw|twtag|ig|px)_(.+)_[^_]+\.[a-zA-Z0-9]+$", item)
-                
+                match = PATTERN_FILENAME_2.search(item)
             if match:
                 prefix = match.group(1).lower()
                 raw_account_id = match.group(2)
@@ -131,7 +130,7 @@ def organize_media_files(target_dir):
                 if account_key in folder_mapping:
                     account_folder = folder_mapping[account_key]
                 else:
-                    # 該当しない場合は元の大文字小文字を維持したままフォルダ名にする
+                    # 該当しない場合は命名規則からフォルダ名にする
                     account_folder = f"{prefix}_{raw_account_id}"
                     account_folder = re.sub(r'[\\/:*?"<>|]', '_', account_folder)
             else:
@@ -153,7 +152,7 @@ def organize_media_files(target_dir):
             try:
                 shutil.move(item_path, dst_path)
                 move_count += 1
-            except Exception as e:
+            except (shutil.Error, OSError) as e:
                 print(f"❌ 移動エラー ({item}): {e}")
 
     # 【2】空になった旧フォルダの削除処理
@@ -168,7 +167,7 @@ def organize_media_files(target_dir):
             try:
                 os.rmdir(root)
                 delete_count += 1
-            except Exception:
+            except OSError as e:
                 pass
 
     print(f"🎉 整理が完了しました！")

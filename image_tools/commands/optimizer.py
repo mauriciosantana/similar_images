@@ -14,6 +14,8 @@ from pathlib import Path
 from collections import defaultdict
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from tqdm import tqdm
+
+from image_tools.utils.exiftool_wrapper import FastExifTool
 from PIL import Image, ImageSequence, UnidentifiedImageError, ImageOps, ImageFile
 import io
 
@@ -75,51 +77,6 @@ class Stats:
 global_stats = Stats()
 
 # ---------------------------------------------------------
-# システム設定・ヘルパー
-# ---------------------------------------------------------
-class FastExifTool:
-    """ExifToolを常駐させて高速に処理するクラス"""
-    def __init__(self, executable):
-        self.executable = executable
-        self.process = None
-
-    def start(self):
-        if not self.executable or not os.path.exists(self.executable):
-            return
-        creationflags = 0x08000000 if os.name == 'nt' else 0
-        self.process = subprocess.Popen(
-            [self.executable, "-stay_open", "True", "-@", "-"],
-            stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-            text=True, encoding="utf-8", bufsize=1, creationflags=creationflags
-        )
-
-    def execute(self, *args):
-        if not self.process or self.process.poll() is not None:
-            self.start()
-        if not self.process:
-            return False
-        
-        for arg in args:
-            self.process.stdin.write(arg + "\n")
-        self.process.stdin.write("-execute\n")
-        self.process.stdin.flush()
-        
-        output = ""
-        while True:
-            line = self.process.stdout.readline()
-            if not line or line.strip() == "{ready}": break
-            output += line
-        return "files updated" in output or "image files read" in output
-
-    def stop(self):
-        if self.process:
-            try:
-                self.process.stdin.write("-stay_open\nFalse\n")
-                self.process.stdin.flush()
-                self.process.wait(timeout=2)
-            except:
-                self.process.kill()
-
 # 各ワーカープロセスごとのグローバルインスタンス
 worker_exiftool = None
 
@@ -186,17 +143,6 @@ def update_optimizer_mtime(folder_path, mtime):
         conn.commit()
         conn.close()
     except Exception: pass
-
-def safe_delete(path):
-    try:
-        if not path.exists():
-            return
-        if path.is_file() and path.suffix.lower() in CONFIG['IMAGE_EXTS']:
-            os.remove(path) 
-        else:
-            send2trash.send2trash(str(path))
-    except Exception as e:
-        print(f"Warning: Could not delete {path}: {e}")
 
 def get_folder_contents(folder_path):
     images = []
@@ -407,6 +353,8 @@ def process_single_image(file_path, as_grayscale=None, min_size_mb=0, max_size_m
 # ---------------------------------------------------------
 # コアロジック
 # ---------------------------------------------------------
+from image_tools.utils.media_utils import safe_delete
+
 def handle_archive(file_path, executor, args, pbar_global):
     should_extract = True
     is_zip = file_path.suffix.lower() == '.zip'

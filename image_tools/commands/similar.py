@@ -20,6 +20,7 @@ from image_tools.paths import PROJECT_ROOT, config_json, hash_cache_db
 from image_tools.cache_db import (
     init_db,
     delete_db_records,
+    update_db_record,
     SQL_INSERT_OR_REPLACE_IMAGE,
 )
 
@@ -27,6 +28,7 @@ from PIL import Image, ImageOps, ImageStat, ImageFile, ImageTk
 import tkinter as tk
 from tkinter import ttk
 import imagehash
+from image_tools.utils.exiftool_wrapper import FastExifTool
 from send2trash import send2trash
 import pybktree
 import concurrent.futures
@@ -713,16 +715,13 @@ class ImageManagerApp(tk.Tk): # Renamed from SimilarImageApp
             p = Path(old_path_str)
 
             # ExifToolの準備（メタデータ保持のため）
-            exif_path = CONFIG.get("EXIFTOOL_PATH") or ""
-            init_worker(exif_path)
+            exiftool_path = CONFIG.get("EXIFTOOL_PATH") or ""
+            worker_exiftool = FastExifTool(exiftool_path) # GUIプロセス内でExifToolを起動
 
             # 最適化実行
             success, saved, new_path, _ = process_single_image(p)
 
             if success and new_path:
-                new_path_str = str(new_path.resolve())
-                
-                # ファイル情報を物理ファイルから再取得 (容量表示が変わらない問題を修正)
                 new_stat = new_path.stat()
                 info["path"] = new_path_str
                 info["filesize"] = new_stat.st_size
@@ -730,12 +729,7 @@ class ImageManagerApp(tk.Tk): # Renamed from SimilarImageApp
                 
                 # DBの情報を更新
                 if self.c:
-                    if new_path_str != old_path_str:
-                        self.c.execute("DELETE FROM images WHERE path = ?", (new_path_str,))
-                    self.c.execute(
-                        "UPDATE images SET path = ?, filesize = ?, mtime = ? WHERE path = ?",
-                        (new_path_str, info["filesize"], info["mtime"], old_path_str)
-                    )
+                    update_db_record(self.c, old_path_str, new_path_str, info["filesize"], info["mtime"])
                     self.conn.commit()
 
                 # サムネイルキャッシュを削除して再生成を促す
@@ -747,6 +741,8 @@ class ImageManagerApp(tk.Tk): # Renamed from SimilarImageApp
                 self.last_action_msg = f"ℹ️ 最適化不要: 容量が変わらないためスキップしました ({p.name})"
 
             self.show_current_group()
+        except ImportError:
+            self.last_action_msg = "❌ 最適化エラー: optimizer.py のインポートに失敗しました。"
         except Exception as e:
             print(f"❌ 最適化エラー詳細: {e}")
             self.last_action_msg = f"❌ 最適化エラー: {e}"
@@ -763,10 +759,10 @@ class ImageManagerApp(tk.Tk): # Renamed from SimilarImageApp
             p = Path(path_str)
 
             # ExifTool のパスを取得
-            import image_tools.settings as app_settings
-            settings = app_settings.load_settings()
-            exiftool_path = settings.get("EXIFTOOL_PATH") or "exiftool"
-
+            exiftool_path = CONFIG.get("EXIFTOOL_PATH") or ""
+            if not exiftool_path:
+                raise FileNotFoundError("ExifToolのパスが設定されていません。")
+            
             # 現在の Orientation を取得
             # 1: Normal, 6: 90 CW, 3: 180, 8: 270 CW
             res = subprocess.run(
@@ -986,9 +982,7 @@ class ImageManagerApp(tk.Tk): # Renamed from SimilarImageApp
                                 if p_str in self.final_kept_paths:
                                     self.final_kept_paths.discard(p_str)
                                     self.final_kept_paths.add(new_p_str)
-                                    self.c.execute("UPDATE images SET path = ? WHERE path = ?", (new_p_str, p_str))
-                                    self.c.execute("UPDATE similarity_edges SET path1 = ? WHERE path1 = ?", (new_p_str, p_str))
-                                    self.c.execute("UPDATE similarity_edges SET path2 = ? WHERE path2 = ?", (new_p_str, p_str))
+                                    update_db_record(self.c, p_str, new_p_str)
                             except Exception as e:
                                 print(f"  ⚠️ リネーム失敗: {old_path.name} ({e})")
             self.conn.commit()

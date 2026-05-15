@@ -20,6 +20,8 @@ import zipfile
 import io
 try:
     from PIL import Image
+    # pillow_avif がないとアニメーションAVIF変換ができないため、インポートを試みる
+    # noqa: F401 は不要
     import pillow_avif
 except ImportError:
     pass
@@ -27,6 +29,7 @@ except ImportError:
 from image_tools.paths import PROJECT_ROOT
 from image_tools import settings as app_settings
 from image_tools.settings import require_setting_str
+from image_tools.utils.media_utils import deep_clean_mp4, PATTERN_FILENAME_1, PATTERN_FILENAME_2, PATTERN_INVALID_CHARS, PATTERN_TARGET_COMMENT, MEDIA_EXTS
 
 _S = app_settings.load_settings()
 _BASE = _S.get("BASE_SAVE_DIR") or ""
@@ -80,13 +83,6 @@ SUCCESS_INJECTED = set()
 
 # --------------------------------------------------------
 # ★ 高速化用オブジェクト (正規表現, JSONキャッシュ, ExifTool常駐)
-# --------------------------------------------------------
-# 1. 正規表現の事前コンパイル
-PATTERN_FILENAME_1 = re.compile(r"^(tw|twtag|ig|px)_(.+?)_\d{8}_\d{6}_")
-PATTERN_FILENAME_2 = re.compile(r"^(tw|twtag|ig|px)_(.+)_[^_]+\.[a-zA-Z0-9]+$")
-PATTERN_INVALID_CHARS = re.compile(r'[\\/:*?"<>|]')
-PATTERN_TARGET_COMMENT = re.compile(r"^(twitter|instagram|pixiv|twtag)\s*:", re.IGNORECASE)
-
 # 3. JSONパースのキャッシュ化
 JSON_CACHE = {}
 JSON_CACHE_LOCK = threading.Lock()
@@ -104,58 +100,7 @@ def load_cached_json(filepath):
     except Exception:
         return None
 
-# 2. ExifToolの起動オーバーヘッド削減(常駐化クラス)
-class FastExifTool:
-    def __init__(self, executable):
-        self.executable = executable
-        self.process = None
-        self.lock = threading.Lock()
-
-    def start(self):
-        if not os.path.exists(self.executable):
-            return
-        # Windows環境で裏コマンド実行時の黒窓ポップアップを防ぐ
-        creationflags = 0x08000000 if os.name == 'nt' else 0
-        self.process = subprocess.Popen(
-            [self.executable, "-stay_open", "True", "-@", "-"],
-            stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-            text=True, encoding="utf-8", bufsize=1, creationflags=creationflags
-        )
-
-    def execute(self, *args):
-        with self.lock:
-            if not self.process or self.process.poll() is not None:
-                self.start()
-            if not self.process:
-                return False, "ExifToolが見つかりません"
-            
-            try:
-                for arg in args:
-                    self.process.stdin.write(arg + "\n")
-                self.process.stdin.write("-execute\n")
-                self.process.stdin.flush()
-                
-                output = ""
-                while True:
-                    line = self.process.stdout.readline()
-                    if not line: break
-                    if line.strip() == "{ready}": break
-                    output += line
-                
-                is_success = "files updated" in output or "files created" in output or "image files read" in output
-                return is_success, output
-            except Exception as e:
-                return False, str(e)
-
-    def stop(self):
-        if self.process:
-            try:
-                self.process.stdin.write("-stay_open\nFalse\n")
-                self.process.stdin.flush()
-                self.process.wait(timeout=3)
-            except Exception:
-                self.process.kill()
-            self.process = None
+from image_tools.utils.exiftool_wrapper import FastExifTool
 
 FAST_EXIFTOOL = FastExifTool(EXIFTOOL_PATH)
 
@@ -163,12 +108,15 @@ FAST_EXIFTOOL = FastExifTool(EXIFTOOL_PATH)
 # ★ ファイル・文字コード対応読み込み関数
 # --------------------------------------------------------
 def read_text_file(filepath):
+    """テキストファイルをUTF-8-SIGまたはCP932で読み込む"""
     try:
         with open(filepath, "r", encoding="utf-8-sig") as f:
             return f.readlines()
     except UnicodeDecodeError:
         with open(filepath, "r", encoding="cp932") as f:
             return f.readlines()
+    except FileNotFoundError:
+        return []
 
 def load_name_cache():
     if os.path.exists(NAME_CACHE_FILE):
@@ -358,7 +306,7 @@ def get_folder_mapping(targets_file):
             if temp_group:
                 groups.append((temp_comment, temp_group))
                 temp_group = []
-            c = line.lstrip("#").strip()
+            c = line.lstrip("#").strip() # コメント行から # を除去
             if PATTERN_TARGET_COMMENT.match(c):
                 continue
             if c:
@@ -395,7 +343,7 @@ def get_folder_mapping(targets_file):
             
         folder_name = comment.strip()
         folder_name = PATTERN_INVALID_CHARS.sub('_', folder_name)
-        folder_name = folder_name.rstrip(" .") 
+        folder_name = folder_name.rstrip(" .") # 末尾のスペースやドットを除去
         
         for account_key in group:
             mapping[account_key] = folder_name
@@ -422,8 +370,7 @@ def organize_single_file(media_path, target_json, folder_mapping, account_keywor
     if not os.path.exists(media_path): return
 
     filename = os.path.basename(media_path)
-    ext = os.path.splitext(filename)[1].lower()
-    video_exts = {".mp4", ".mov", ".webm", ".avi", ".mkv", ".m4v"}
+    ext = os.path.splitext(filename)[1].lower() # 拡張子
     base_dst_dir = VIDEO_SAVE_DIR if ext in video_exts else IMAGE_SAVE_DIR
     
     account_folder = "Unknown"
@@ -485,35 +432,6 @@ def organize_single_file(media_path, target_json, folder_mapping, account_keywor
     except Exception:
         pass
 
-# --------------------------------------------------------
-# ★ メディア処理・メタデータ注入関数
-# --------------------------------------------------------
-def deep_clean_mp4(file_path):
-    if not file_path.lower().endswith(".mp4"):
-        return True
-    
-    temp_path = file_path + ".clean.mp4"
-    conv_cmd = [
-        "ffmpeg", "-i", file_path, "-c", "copy",
-        "-map_metadata", "-1", "-fflags", "+bitexact",
-        "-movflags", "+faststart", "-y", temp_path
-    ]
-    
-    try:
-        result = subprocess.run(conv_cmd, capture_output=True)
-        if result.returncode == 0 and os.path.exists(temp_path):
-            os.replace(temp_path, file_path)
-            return True
-            
-        err_msg = result.stderr.decode('cp932', errors='replace')
-        print(f"\n❌ [FFmpeg エラー] {os.path.basename(file_path)}: {err_msg.strip()}")
-        if os.path.exists(temp_path): 
-            os.remove(temp_path)
-        return False
-        
-    except Exception as e:
-        print(f"\n❌ [FFmpeg 実行例外] {e}")
-        return False
 
 def convert_ugoira_zip_to_avif(zip_path, json_path=None):
     """PixivのうごイラZIPをアニメーションAVIFに変換する"""
@@ -569,7 +487,7 @@ def convert_ugoira_zip_to_avif(zip_path, json_path=None):
 
 def _background_inject(media_path, exiftool_path, folder_mapping, account_keywords, is_final_sweep=False):
     # 渡された文字が何であれ、ファイル名だけを抜き出して強制的に正しい保存先を指定する
-    media_path = os.path.join(BASE_SAVE_DIR, os.path.basename(media_path))
+    media_path = os.path.join(BASE_SAVE_DIR, os.path.basename(media_path)) # BASE_SAVE_DIR直下にあると仮定
 
     if media_path.lower().endswith(".zip"):
         SUCCESS_INJECTED.add(os.path.basename(media_path))
@@ -657,8 +575,6 @@ def inject_and_organize_files():
     for d in (json_dir, IMAGE_SAVE_DIR, VIDEO_SAVE_DIR, NOJSON_SAVE_DIR):
         os.makedirs(d, exist_ok=True)
         
-    video_exts = {".mp4", ".mov", ".webm", ".avi", ".mkv", ".m4v"}
-    image_exts = {".jpg", ".jpeg", ".png", ".gif", ".webp", ".avif", ".bmp"}
     
     targets_filepath = (
         TARGETS_FILE
