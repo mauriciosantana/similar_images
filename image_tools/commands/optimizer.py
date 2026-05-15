@@ -137,6 +137,12 @@ def set_low_priority():
     except Exception:
         pass
 
+def wait_if_memory_low(threshold=90.0):
+    """メモリ使用率が高すぎる場合に待機する"""
+    while psutil.virtual_memory().percent > threshold:
+        # メモリが回復するまで待機
+        time.sleep(2)
+
 def get_db_cache():
     """DBからパス、サイズ、更新日時を取得して辞書で返す"""
     db_path = hash_cache_db()
@@ -452,6 +458,21 @@ def handle_archive(file_path, executor, args, pbar_global):
 def flatten_directory(current_path):
     folders, images, archives = get_folder_contents(current_path)
     
+    # 現在のフォルダ(current_path)自体が「1つのフォルダのみ」を含む殻である場合、中身を引き上げる
+    # これにより A/B/C... と入れ子になっていても、一番上の A の直下にファイルが集まるようになる
+    if len(images) == 0 and len(archives) == 0 and len(folders) == 1:
+        target_inner = folders[0]
+        try:
+            for item in target_inner.iterdir():
+                shutil.move(str(item), str(current_path))
+            
+            # 中身をすべて移動させた後、空になった inner フォルダを削除
+            if not any(target_inner.iterdir()):
+                target_inner.rmdir()
+            return True
+        except Exception as e:
+            print(f"⚠️ Flatten top-level shell error: {e}")
+
     for subfolder in folders:
         sub_folders, sub_images, sub_archives = get_folder_contents(subfolder)
         total_sub_items = len(sub_folders) + len(sub_images) + len(sub_archives)
@@ -462,15 +483,18 @@ def flatten_directory(current_path):
 
         if len(sub_images) == 0 and len(sub_archives) == 0 and len(sub_folders) == 1:
             target_inner = sub_folders[0]
-            dest_path = current_path / target_inner.name
-            
-            if not dest_path.exists():
-                try:
-                    shutil.move(str(target_inner), str(current_path))
-                    safe_delete(subfolder)
-                    return True
-                except Exception as e:
-                    print(f"⚠️ Flatten folder error: {e}")
+            # 最も上の階層のサブフォルダ名（subfolder.name）を維持するため、
+            # 内側のフォルダ（target_inner）の中身を subfolder 直下に移動し、空になった target_inner を削除する
+            try:
+                for item in target_inner.iterdir():
+                    shutil.move(str(item), str(subfolder))
+                
+                # 中身をすべて移動させた後、空になった inner フォルダを削除
+                if not any(target_inner.iterdir()):
+                    target_inner.rmdir()
+                return True
+            except Exception as e:
+                print(f"⚠️ Flatten folder error: {e}")
 
         if len(sub_images) == 0 and len(sub_folders) == 0 and len(sub_archives) == 1:
             target_archive = sub_archives[0]
@@ -572,6 +596,8 @@ def process_images_in_folder(folder_path, executor, args, db_cache=None, image_l
     desc = f" 🖼️  Optimizing: {folder_name[:30]}"
     
     for future in tqdm(as_completed(futures), total=len(candidates), desc=desc, leave=False, unit="img"):
+        # 各画像の処理完了ごとにメモリをチェックし、必要なら次へ行く前に待機
+        wait_if_memory_low(92.0)
         success, saved, avif_path, original_path = future.result()
         
         if success and avif_path:

@@ -42,6 +42,7 @@ COOKIES_FILE = str(PROJECT_ROOT / "cookies.txt")
 COMPLETED_FILE = str(PROJECT_ROOT / "completed_accounts.txt")
 TARGETS_FILE = str(PROJECT_ROOT / "targets.txt")
 NAME_CACHE_FILE = str(PROJECT_ROOT / "account_names.json")
+ACCOUNT_STATS_FILE = str(PROJECT_ROOT / "account_stats.json")
 
 FAKE_USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36 Edg/122.0.0.0"
 
@@ -183,6 +184,42 @@ def save_name_cache(cache):
             JSON_CACHE[NAME_CACHE_FILE] = cache
     except Exception:
         pass
+
+def load_account_stats():
+    if os.path.exists(ACCOUNT_STATS_FILE):
+        return load_cached_json(ACCOUNT_STATS_FILE) or {}
+    return {}
+
+def save_account_stats(stats):
+    try:
+        with open(ACCOUNT_STATS_FILE, "w", encoding="utf-8") as f:
+            json.dump(stats, f, ensure_ascii=False, indent=4)
+        with JSON_CACHE_LOCK:
+            JSON_CACHE[ACCOUNT_STATS_FILE] = stats
+    except Exception:
+        pass
+
+def should_skip_account(platform, account, stats):
+    identifier = f"{platform}:{account}"
+    if identifier not in stats:
+        return False, 0
+    
+    entry = stats[identifier]
+    last_check = entry.get("last_check", 0)
+    last_new = entry.get("last_new", 0)
+    now = time.time()
+    
+    # 最後に新しい画像が見つかってからの経過日数
+    days_since_new = (now - last_new) / 86400
+    
+    # 更新頻度が低いほど間隔を広げる (1日未更新なら2日おき、2日なら3日おき... 最大7日)
+    interval_days = min(7, int(days_since_new) + 1)
+    
+    # 最後の確認からインターバルが経過していなければスキップ
+    if (now - last_check) < (interval_days * 86400):
+        remaining_days = interval_days - (now - last_check) / 86400
+        return True, remaining_days
+    return False, 0
 
 def extract_name_from_meta(platform, meta):
     if platform == "twitter_hashtag":
@@ -788,7 +825,7 @@ def inject_and_organize_files():
 # --------------------------------------------------------
 # ★ ダウンロード実行処理
 # --------------------------------------------------------
-def download_account(platform, account, config, completed_accounts, bg_executor, folder_mapping, account_keywords, keywords=None, min_likes=0):
+def download_account(platform, account, config, completed_accounts, bg_executor, folder_mapping, account_keywords, keywords=None, min_likes=0, ignore_history=False):
     identifier = f"{platform}:{account}"
     url = config["url_template"].format(account)
     prefix = config["prefix"]
@@ -807,11 +844,14 @@ def download_account(platform, account, config, completed_accounts, bg_executor,
         fn_account = "{author[nick]}#" + account
 
     command = [
-        "gallery-dl", "--cookies", COOKIES_FILE, "--download-archive", ARCHIVE_FILE,
+        "gallery-dl", "--cookies", COOKIES_FILE,
         "--sleep", "4-6", "--sleep-request", "4-6", "-d", BASE_SAVE_DIR,       
         "-o", "directory=.", "-o", f"filename={fn_prefix}_{fn_account}_{{date:%Y%m%d_%H%M%S}}_{{id}}_{{num}}.{{extension}}",
         "--write-metadata", "--exec", "cmd /c echo GAL_DL_SUCCESS:::{}"
     ]
+    if not ignore_history:
+        command.extend(["--download-archive", ARCHIVE_FILE])
+
     command.extend(config["args"])
     
     filter_exprs = []
@@ -839,11 +879,12 @@ def download_account(platform, account, config, completed_accounts, bg_executor,
             if min_likes > 0:
                 print(f"🔍 [フィルタ有効] 最小いいね数: {min_likes} ")
 
-    if identifier in completed_accounts:
+    if identifier in completed_accounts and not ignore_history:
         print(f"🚀 [{platform}] {display_name} (高速差分モード)")
         command.extend(["--abort", "3"])
     else:
-        print(f"🐢 [{platform}] {display_name} (初回/未完了継続モード)")
+        mode_text = "履歴無視モード" if ignore_history else "初回/未完了継続モード"
+        print(f"🐢 [{platform}] {display_name} ({mode_text})")
 
     command.append(url)
     
@@ -942,6 +983,22 @@ def download_account(platform, account, config, completed_accounts, bg_executor,
             
         process.wait()
         print(f"\r{' '*80}\r✅ 完了!    [ 新規: {dl_count}件 / エラー: {err_count}件 ]")
+
+        # 統計情報の更新 (致命的なエラーでない場合)
+        if not is_critical_error:
+            stats = load_account_stats()
+            ident = f"{platform}:{account}"
+            now = time.time()
+            if ident not in stats:
+                stats[ident] = {}
+            
+            stats[ident]["last_check"] = now
+            if dl_count > 0:
+                stats[ident]["last_new"] = now
+            elif "last_new" not in stats[ident]:
+                # 初回チェックで何も見つからなかった場合、現在時刻を起算点とする
+                stats[ident]["last_new"] = now
+            save_account_stats(stats)
         
         if process.returncode == 0 and err_count == 0:
             if identifier not in completed_accounts:
@@ -959,14 +1016,22 @@ def download_account(platform, account, config, completed_accounts, bg_executor,
         FAST_EXIFTOOL.stop() # 終了時に常駐プロセスも安全に切断
         sys.exit(0)
 
-def run_downloader(do_organize=True, platforms=None, min_likes=0):
+def run_downloader(do_organize=True, platforms=None, min_likes=0, specific_ids=None, force_check=False):
     require_setting_str("BASE_SAVE_DIR")
     completed_accounts = load_completed_list()
-    targets = load_targets()
+    account_stats = load_account_stats()
     os.makedirs(BASE_SAVE_DIR, exist_ok=True)
 
     if platforms is None:
         platforms = ["pixiv", "twitter"]
+
+    ignore_history = False
+    if specific_ids:
+        targets = {pf: [{"id": sid, "keywords": []} for sid in specific_ids] for pf in platforms}
+        ignore_history = True
+        print(f"✨ 特定ID指定ダウンロード: {', '.join(specific_ids)} (履歴を無視して取得します)")
+    else:
+        targets = load_targets()
 
     targets_filepath = (
         TARGETS_FILE
@@ -987,8 +1052,18 @@ def run_downloader(do_organize=True, platforms=None, min_likes=0):
 
                 for target_info in accounts:
                     account = target_info["id"]
+
+                    # 更新頻度に基づくスキップ判定 (特定ID指定や強制実行時は無視)
+                    if not specific_ids and not force_check:
+                        skip, remaining = should_skip_account(platform, account, account_stats)
+                        if skip:
+                            account_name = get_account_name(platform, config["prefix"], account)
+                            display_name = f"{account_name} ({account})" if account_name and account_name != account else account
+                            print(f"⏭️  [{platform}] {display_name}: 投稿頻度により確認を延期 (残り約 {remaining:.1f}日)")
+                            continue
+
                     keywords = target_info["keywords"]
-                    is_critical = download_account(platform, account, config, completed_accounts, bg_executor, folder_mapping, account_keywords, keywords, min_likes=min_likes)
+                    is_critical = download_account(platform, account, config, completed_accounts, bg_executor, folder_mapping, account_keywords, keywords, min_likes=min_likes, ignore_history=ignore_history)
                     if is_critical:
                         print(f"\n🚨 安全のため、{platform} の残りのアカウントをスキップします。\n")
                         break
@@ -1016,6 +1091,8 @@ def main():
     parser.add_argument("-tg", "--hashtag", action="store_true", help="Twitterハッシュタグを対象にする")
     parser.add_argument("--skip-organize", action="store_true", help="ダウンロード後のファイル整理をスキップする")
     parser.add_argument("--min-likes", type=int, default=MIN_TWITTER_LIKES, help="Twitterの最小「いいね」数")
+    parser.add_argument("-id", "--ids", nargs="+", help="特定のIDを指定してダウンロード (履歴無視)")
+    parser.add_argument("-f", "--force", action="store_true", help="更新頻度によるスキップを無視して強制チェックする")
     
     args = parser.parse_args()
     
@@ -1029,7 +1106,7 @@ def main():
     if not selected_platforms:
         selected_platforms = ["pixiv", "twitter"]
         
-    run_downloader(do_organize=not args.skip_organize, platforms=selected_platforms, min_likes=args.min_likes)
+    run_downloader(do_organize=not args.skip_organize, platforms=selected_platforms, min_likes=args.min_likes, specific_ids=args.ids, force_check=args.force)
 
 if __name__ == "__main__":
     main()

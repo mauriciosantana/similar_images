@@ -1,6 +1,8 @@
 """PDF をページ単位で AVIF に書き出す。"""
 
 from pathlib import Path
+import time
+import psutil
 
 import fitz  # PyMuPDF
 from PIL import Image
@@ -40,6 +42,10 @@ def convert_pdf_to_avif(pdf_path: Path, output_dir: Path, dpi: int, quality: int
         mat = fitz.Matrix(zoom, zoom)
 
         for i, page in enumerate(doc):
+            # メモリ使用率が高い場合は一旦停止
+            if psutil.virtual_memory().percent > 90:
+                time.sleep(2)
+
             pix = page.get_pixmap(matrix=mat)
             img = Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
             output_file = target_folder / f"{folder_name}_{i + 1:03d}.avif"

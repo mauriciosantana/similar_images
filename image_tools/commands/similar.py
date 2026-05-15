@@ -8,11 +8,13 @@ import math
 import datetime
 import json
 import logging
+import psutil
 from collections import defaultdict, deque
 from dataclasses import dataclass
 from pathlib import Path
 import threading
 import shutil
+import subprocess
 
 from image_tools.paths import PROJECT_ROOT, config_json, hash_cache_db
 from image_tools.cache_db import (
@@ -116,6 +118,38 @@ def normalize_selection_command(ans: str) -> NormalizedSelectionCommand:
     return NormalizedSelectionCommand(is_protect=is_protect, is_all_at=is_all_at, body=s)
 
 
+def parse_indices(text: str, n: int) -> list[tuple[int, bool]]:
+    """
+    コマンド文字列を解析して (インデックス, @フラグ) のリストを返す。
+    n <= 9 の場合、'123' は 1, 2, 3 番目と解釈する。
+    """
+    results = []
+    parts = text.split()
+    for part in parts:
+        has_at = "@" in part or "+" in part
+        nums_str = part.replace("@", "").replace("+", "")
+        
+        if not nums_str:
+            if has_at: # "@" 単体なら 1番目に適用
+                results.append((0, True))
+            continue
+
+        if n <= 9:
+            # 1桁モード: 各文字を個別のインデックスとして扱う
+            for char in nums_str:
+                if char.isdigit():
+                    idx = int(char) - 1
+                    if 0 <= idx < n:
+                        results.append((idx, has_at))
+        else:
+            # 通常モード: スペース区切りの数字を扱う
+            if nums_str.isdigit():
+                idx = int(nums_str) - 1
+                if 0 <= idx < n:
+                    results.append((idx, has_at))
+    return results
+
+
 def is_excluded_path(p_str: str, exclude_names: set[str], exclude_abs_paths: list[str]) -> bool:
     """パス文字列が除外設定に含まれているか判定"""
     p_norm = p_str.replace('\\', '/')
@@ -151,8 +185,8 @@ def compute_selection_indices(cmd: NormalizedSelectionCommand, file_names: list[
         return SelectionResult(
             keep_indices=keep_indices,
             at_indices=at_indices,
-            last_action_msg=f"{action_prefix}すべてを残しました",
-            log_line="  -> すべてを残しました。",
+            last_action_msg=f"{action_prefix}すべてを残しました (計{n}枚)",
+            log_line=f"  -> すべてを残しました: {', '.join(file_names)}",
         )
 
     if body in ("0", "d"):
@@ -164,21 +198,12 @@ def compute_selection_indices(cmd: NormalizedSelectionCommand, file_names: list[
         )
 
     try:
-        work = body
-        if work in ("@", "+"):
-            work = "1@"
-
-        for part in work.split():
-            has_at = ("@" in part) or ("+" in part)
-            num_str = part.replace("@", "").replace("+", "")
-            if not num_str:
-                continue
-            idx_val = int(num_str) - 1
-            if 0 <= idx_val < n:
-                if idx_val not in keep_indices:
-                    keep_indices.append(idx_val)
-                if has_at and idx_val not in at_indices:
-                    at_indices.append(idx_val)
+        indices_info = parse_indices(body, n)
+        for idx_val, has_at in indices_info:
+            if idx_val not in keep_indices:
+                keep_indices.append(idx_val)
+            if has_at and idx_val not in at_indices:
+                at_indices.append(idx_val)
 
         if not keep_indices:
             return SelectionResult(
@@ -188,13 +213,14 @@ def compute_selection_indices(cmd: NormalizedSelectionCommand, file_names: list[
                 log_line=None,
             )
 
-        kept_numbers_str = ", ".join([str(i + 1) for i in keep_indices])
+        kept_info = ", ".join([str(i + 1) for i in keep_indices]) + "番"
+
         at_text = "[＠マーク] " if at_indices else ""
 
         return SelectionResult(
             keep_indices=keep_indices,
             at_indices=at_indices,
-            last_action_msg=f"{action_prefix}{at_text}残しました -> {kept_numbers_str}番",
+            last_action_msg=f"{action_prefix}{at_text}残しました -> {kept_info}",
             log_line=f"  -> 指定された画像を残しました: {', '.join([file_names[i] for i in keep_indices])}", # ログには詳細なファイル名を残す
         )
     except ValueError:
@@ -395,7 +421,7 @@ class ImageManagerApp(tk.Tk): # Renamed from SimilarImageApp
         self.status_label.pack(side=tk.TOP, pady=2)
 
         # Unified guide text for both modes
-        self.guide_label = ttk.Label(self.bottom_frame, text="【入力例】a 全残す / d 全削除 / b 戻る / s 判定保存 / m 移動 / t 即時削除 / q フォルダスキップ / w 全体終了", font=("Meiryo", 11))
+        self.guide_label = ttk.Label(self.bottom_frame, text="【入力例】a 全残す / d 全削除 / s 保存 / v1 開く / o1 最適化 / r1 回転(90°) / 🖱️ダブルクリック", font=("Meiryo", 11))
         self.guide_label.pack(side=tk.TOP, pady=2)
 
         self.entry_var = tk.StringVar()
@@ -483,14 +509,26 @@ class ImageManagerApp(tk.Tk): # Renamed from SimilarImageApp
 
         self.quit() # Exit if all groups are processed
 
-    def _calc_thumb_dims(self, total_imgs):
-        """表示枚数に基づいた最適なサムネイルサイズを計算"""
-        if total_imgs <= 0: return 150, 150
+    def _calc_thumb_dims(self, infos):
+        """表示枚数とアスペクト比に基づいた最適なサムネイルサイズと列数を計算"""
+        total_imgs = len(infos)
+        if total_imgs <= 0: return 150, 150, 1
+
+        avg_aspect = sum(info['aspect_ratio'] for info in infos) / total_imgs if total_imgs > 0 else 1.0
+
+        # 横長画像(Landscape)が多い場合は、列数を2列に絞って大きく表示する
+        if avg_aspect > 1.2 and total_imgs >= 2:
+            max_cols = 2
+        else:
+            max_cols = min(self.num_per_page, total_imgs) if self.mode == "picker" else min(4, total_imgs)
+
+        if max_cols < 1: max_cols = 1
+
         screen_w = self.winfo_screenwidth() - 50
         screen_h = self.winfo_screenheight() - 250
-        max_cols = min(self.num_per_page, total_imgs) if self.mode == "picker" else min(4, total_imgs)
         rows = math.ceil(total_imgs / max_cols)
-        return max(150, screen_w // max_cols), max(150, screen_h // rows)
+
+        return max(150, screen_w // max_cols), max(150, screen_h // rows), max_cols
 
     def _get_thumbnail_pil(self, path, w, h):
         """画像を読み込み、リサイズ・回転済みのPILオブジェクトを返す（キャッシュ対応）"""
@@ -518,29 +556,38 @@ class ImageManagerApp(tk.Tk): # Renamed from SimilarImageApp
         except Exception:
             return None
 
-    def _preload_next_groups(self, count=2):
-        """未来のグループの画像をバックグラウンドで読み込んでおく"""
-        if self.mode != "similar":
-            return
-
+    def _preload_next_groups(self, count=3):
+        """未来の数ページ分の画像をバックグラウンドで読み込み、デコードしてキャッシュしておく"""
         idx = self.current_idx + 1
         preloaded = 0
         while idx < len(self.groups) and preloaded < count:
-            group_infos = [self.image_infos[j] for j in self.groups[idx]]
-            filtered, _, _ = filter_similar_group_members(group_infos)
-            if len(filtered) > 1:
-                w, h = self._calc_thumb_dims(len(filtered))
+            group_indices = self.groups[idx]
+            group_infos = [self.image_infos[j] for j in group_indices]
+            
+            if self.mode == "similar":
+                # 類似画像モードでは、低解像度を除外した後の画像のみを対象にする
+                filtered, _, _ = filter_similar_group_members(group_infos)
+                if len(filtered) <= 1: # 1枚以下なら自動スキップされるため読み飛ばす
+                    idx += 1
+                    continue
+            else:
+                filtered = group_infos
+
+            if filtered:
+                w, h, _ = self._calc_thumb_dims(filtered)
                 for info in filtered:
-                    if info["path"] not in self.thumbnail_cache:
-                        self.thumbnail_executor.submit(self._get_thumbnail_pil, info["path"], w, h)
+                    path = info["path"]
+                    with self.cache_lock:
+                        if path in self.thumbnail_cache:
+                            continue
+                    self.thumbnail_executor.submit(self._get_thumbnail_pil, path, w, h)
                 preloaded += 1
             idx += 1
 
     def _populate_image_grid(self, filtered_infos, max_pixels, size_info_str):
         """サムネイルグリッドとステータス行の描画"""
         total_imgs = len(filtered_infos)
-        img_w, img_h = self._calc_thumb_dims(total_imgs)
-        max_cols = min(4, total_imgs) if total_imgs > 0 else 1
+        img_w, img_h, max_cols = self._calc_thumb_dims(filtered_infos)
         rows = math.ceil(total_imgs / max_cols) if total_imgs > 0 else 1
 
         for c in range(10):
@@ -573,15 +620,23 @@ class ImageManagerApp(tk.Tk): # Renamed from SimilarImageApp
             frame.grid(row=row_idx, column=col_idx, sticky="nsew", padx=5, pady=5)
             ext = p.suffix.upper()
             ratio = info["pixels"] / max_pixels
-
+            
+            mark = "" # Default mark
+            color = "black" # Default color for picker mode (non-protected)
+            
             if contains_protect_marker(p.name):
-                mark, color = "[保護済]", "blue"
-            elif info["pixels"] == max_pixels:
-                mark, color = "★最高画質", "red"
-            elif ratio >= 0.8:
-                mark, color = "○近い画質", "green"
-            else:
-                mark, color = "△低画質", "gray"
+                mark = "[保護済]"
+                color = "blue"
+            elif self.mode == "similar": # Only apply resolution-based styling in similar mode
+                if info["pixels"] == max_pixels:
+                    mark = "★最高画質"
+                    color = "red"
+                elif ratio >= 0.8:
+                    mark = "○近い画質"
+                    color = "green"
+                else:
+                    mark = "△低画質"
+                    color = "gray"
 
             folder_and_file = f"{p.parent.name}/{p.name}"
             display_path = (folder_and_file[:40] + '...') if len(folder_and_file) > 43 else folder_and_file
@@ -593,6 +648,12 @@ class ImageManagerApp(tk.Tk): # Renamed from SimilarImageApp
             # プレースホルダー表示
             img_lbl = tk.Label(frame, text="Loading...", bg=bg_color)
             img_lbl.pack(side=tk.TOP, expand=True)
+
+            # ダブルクリックで開くイベントをバインド
+            path_for_click = info["path"]
+            frame.bind("<Double-Button-1>", lambda e, p=path_for_click: self._open_file(e, p))
+            lbl.bind("<Double-Button-1>", lambda e, p=path_for_click: self._open_file(e, p))
+            img_lbl.bind("<Double-Button-1>", lambda e, p=path_for_click: self._open_file(e, p))
             
             # 非同期で画像を読み込み
             self.thumbnail_executor.submit(self._load_thumbnail_async, info["path"], img_w, img_h, img_lbl, bg_color)
@@ -609,6 +670,14 @@ class ImageManagerApp(tk.Tk): # Renamed from SimilarImageApp
 
     def _load_thumbnail_async(self, path, w, h, label, bg_color):
         """別スレッドで画像を読み込み、PIL画像をメインスレッドに渡す"""
+        # メモリ使用率が極端に高い場合は、読み込みを少し遅延させる
+        if psutil.virtual_memory().percent > 90:
+            time.sleep(1)
+            # さらに高い場合はキャッシュを半分捨てる
+            if psutil.virtual_memory().percent > 95:
+                with self.cache_lock:
+                    self.thumbnail_cache.clear()
+
         img = self._get_thumbnail_pil(path, w, h)
         if img:
             self.after(0, self._update_image_label, label, img)
@@ -624,6 +693,111 @@ class ImageManagerApp(tk.Tk): # Renamed from SimilarImageApp
                 label.config(image=pimg, text="")
             except Exception:
                 label.config(text="UI Error", fg="red")
+
+    def _open_file(self, event, path):
+        """画像を関連付けられたアプリケーションで開く"""
+        try:
+            os.startfile(path)
+        except Exception as e:
+            print(f"❌ ファイルを開けませんでした ({Path(path).name}): {e}")
+
+    def _optimize_file(self, idx):
+        """指定した画像を個別にAVIFへ変換（最適化）する"""
+        try:
+            if not (0 <= idx < len(self.current_filtered_infos)):
+                return
+
+            from image_tools.commands.optimizer import process_single_image, init_worker, CONFIG
+            info = self.current_filtered_infos[idx]
+            old_path_str = info["path"]
+            p = Path(old_path_str)
+
+            # ExifToolの準備（メタデータ保持のため）
+            exif_path = CONFIG.get("EXIFTOOL_PATH") or ""
+            init_worker(exif_path)
+
+            # 最適化実行
+            success, saved, new_path, _ = process_single_image(p)
+
+            if success and new_path:
+                new_path_str = str(new_path.resolve())
+                
+                # ファイル情報を物理ファイルから再取得 (容量表示が変わらない問題を修正)
+                new_stat = new_path.stat()
+                info["path"] = new_path_str
+                info["filesize"] = new_stat.st_size
+                info["mtime"] = new_stat.st_mtime
+                
+                # DBの情報を更新
+                if self.c:
+                    if new_path_str != old_path_str:
+                        self.c.execute("DELETE FROM images WHERE path = ?", (new_path_str,))
+                    self.c.execute(
+                        "UPDATE images SET path = ?, filesize = ?, mtime = ? WHERE path = ?",
+                        (new_path_str, info["filesize"], info["mtime"], old_path_str)
+                    )
+                    self.conn.commit()
+
+                # サムネイルキャッシュを削除して再生成を促す
+                with self.cache_lock:
+                    self.thumbnail_cache.pop(old_path_str, None)
+
+                self.last_action_msg = f"✨ 最適化完了: {p.name} ({format_size(saved)} 削減)"
+            else:
+                self.last_action_msg = f"ℹ️ 最適化不要: 容量が変わらないためスキップしました ({p.name})"
+
+            self.show_current_group()
+        except Exception as e:
+            print(f"❌ 最適化エラー詳細: {e}")
+            self.last_action_msg = f"❌ 最適化エラー: {e}"
+            self.show_current_group()
+
+    def _rotate_file(self, idx):
+        """指定した画像の Orientation メタデータを更新して、画質を劣化させずに 90度回転させる"""
+        try:
+            if not (0 <= idx < len(self.current_filtered_infos)):
+                return
+
+            info = self.current_filtered_infos[idx]
+            path_str = info["path"]
+            p = Path(path_str)
+
+            # ExifTool のパスを取得
+            import image_tools.settings as app_settings
+            settings = app_settings.load_settings()
+            exiftool_path = settings.get("EXIFTOOL_PATH") or "exiftool"
+
+            # 現在の Orientation を取得
+            # 1: Normal, 6: 90 CW, 3: 180, 8: 270 CW
+            res = subprocess.run(
+                [exiftool_path, "-Orientation", "-n", "-s3", path_str],
+                capture_output=True, text=True, check=False
+            )
+            curr_val = res.stdout.strip()
+            curr = int(curr_val) if curr_val.isdigit() else 1
+            
+            # 90度ずつ右回転させるサイクル (1 -> 6 -> 3 -> 8 -> 1)
+            next_orient = {1: 6, 6: 3, 3: 8, 8: 1}.get(curr, 6)
+
+            # メタデータのみを書き換え (ロスレス回転)
+            subprocess.run(
+                [exiftool_path, f"-Orientation={next_orient}", "-n", "-overwrite_original", path_str],
+                check=True, capture_output=True
+            )
+
+            # サムネイルキャッシュを削除して再描画を促す
+            with self.cache_lock:
+                self.thumbnail_cache.pop(path_str, None)
+            
+            # 縦横比情報を更新 (90度回転なので反転させる)
+            if info["aspect_ratio"] > 0:
+                info["aspect_ratio"] = 1.0 / info["aspect_ratio"]
+
+            self.last_action_msg = f"🔄 ロスレス回転完了 (90°CW): {p.name}"
+            self.show_current_group()
+        except Exception as e:
+            self.last_action_msg = f"❌ 回転エラー: {e}"
+            self.show_current_group()
 
     def _record_action(self, idx, trash, protect, at):
         self.trash_actions[idx] = trash
@@ -656,7 +830,45 @@ class ImageManagerApp(tk.Tk): # Renamed from SimilarImageApp
         self._apply_command(ans)
 
     def _apply_command(self, ans):
-        if ans == 'w':
+        ans_lower = ans.lower()
+
+        # 閲覧コマンド (v1, v2...)
+        if ans_lower.startswith('v'):
+            try:
+                val = int(ans_lower[1:]) - 1
+                if 0 <= val < len(self.current_filtered_infos):
+                    self._open_file(None, self.current_filtered_infos[val]["path"])
+                    self.entry_var.set("") # 入力欄をクリア
+                    return
+            except ValueError:
+                pass
+
+        # 最適化コマンド (o1, o2...)
+        if ans_lower.startswith('o'):
+            try:
+                # o1 2 3 のように複数指定可能にする
+                parts = ans_lower[1:].split()
+                if parts:
+                    for part in parts:
+                        self._optimize_file(int(part) - 1)
+                self.entry_var.set("")
+                return
+            except ValueError:
+                pass
+
+        # 回転コマンド (r1, r2...)
+        if ans_lower.startswith('r'):
+            try:
+                parts = ans_lower[1:].split()
+                if not parts: parts = ["1"]
+                for part in parts:
+                    self._rotate_file(int(part) - 1)
+                self.entry_var.set("")
+                return
+            except ValueError:
+                pass
+
+        if ans_lower == 'w':
             print("🛑 プログラム全体を終了します。これまでの判定を反映します。")
             self.quit_entire_script = True
             self.quit()
@@ -736,8 +948,9 @@ class ImageManagerApp(tk.Tk): # Renamed from SimilarImageApp
 
     def apply_pending_actions(self):
         if self.skip_apply:
-            print("ℹ️ スキップが選択されたため、このフォルダの未保存の判定は反映されません。")
-            return
+            # スキップ時も、それまでに Enter で確定させた分は反映するように変更
+            if self.trash_actions or self.protect_actions or self.at_actions:
+                print("ℹ️ フォルダスキップが選択されました。確定済みの判定のみ反映します。")
 
         if not self.c or not self.conn or not self.args:
             return
@@ -931,6 +1144,10 @@ def scan_and_sync_files(args, config, conn, c, needs_scan, target_dirs_paths, to
         with concurrent.futures.ProcessPoolExecutor(max_workers=n_workers) as executor:
             results = executor.map(compute_image_info, args_list, chunksize=chunk)
             for path_str, res in tqdm(results, total=len(args_list), desc="⏳ 画像解析"):
+                # 解析ループ内でのメモリ監視
+                if psutil.virtual_memory().percent > 90:
+                    time.sleep(0.5)
+
                 if res:
                     batch.append((*res, 0))
                     if not _is_ex(path_str):
@@ -1097,34 +1314,46 @@ def execute_picker_workflow(current_all_infos, args, c, conn, target_prefix):
     folder_kept_paths = set(protected_paths)
 
     if picker_infos:
-        if args.sort_size:
-            picker_infos.sort(key=lambda x: x['filesize'], reverse=True)
-        else:
-            picker_infos.sort(key=lambda x: x['path'])
+        # 縦横比に基づいてグループ化（縦長・スクエア: <= 1.1, 横長: > 1.1）
+        # ページ内で向きを揃えることで、表示サイズが小さくなるのを防ぐ
+        portraits = [info for info in picker_infos if info.get('aspect_ratio', 1.0) <= 1.1]
+        landscapes = [info for info in picker_infos if info.get('aspect_ratio', 1.0) > 1.1]
 
-        groups = [list(range(i, min(i + args.num, len(picker_infos)))) for i in range(0, len(picker_infos), args.num)]
+        if args.sort_size:
+            portraits.sort(key=lambda x: x['filesize'], reverse=True)
+            landscapes.sort(key=lambda x: x['filesize'], reverse=True)
+        else:
+            portraits.sort(key=lambda x: x['path'])
+            landscapes.sort(key=lambda x: x['path'])
+
+        # 向きを揃えた状態でリストを再構成
+        picker_infos = portraits + landscapes
+        
+        groups = []
+        # 縦長グループのページ分割
+        p_len = len(portraits)
+        for i in range(0, p_len, args.num):
+            groups.append(list(range(i, min(i + args.num, p_len))))
+            
+        # 横長グループのページ分割（インデックスをオフセットして開始）
+        l_len = len(landscapes)
+        for i in range(0, l_len, args.num):
+            groups.append(list(range(p_len + i, p_len + min(i + args.num, l_len))))
+
         print(f"🚀 選別開始: {len(picker_infos)} 枚 ({len(groups)} ページ)")
 
         app = run_image_manager_gui(groups, picker_infos, args, c, conn, mode="picker", num_per_page=args.num)
         
+        # q を押してスキップした場合も、そこまでに「残す」と決めた分（完了ページ分）は反映させる
+        folder_kept_paths.update(app.final_kept_paths)
+
+        # 個別ファイルの移動処理 (中断(w)やスキップ(q)時も、そこまでの確定分は移動させる)
+        if args.move:
+            move_kept_files(folder_kept_paths, args, c, conn)
+
         if app.quit_entire_script:
             return True # スクリプト全体終了フラグ
 
-        # GUIが閉じられた際、明示的に削除(d/0)を選択しなかった未処理分（現在のページ以降）を
-        # 全て「維持」および「移動」の対象として確実にマークする
-        for i in range(app.current_idx, len(app.groups)):
-            for info_idx in app.groups[i]:
-                p_str = app.image_infos[info_idx]['path']
-                if not any(p_str in t_list for t_list in app.trash_actions.values()):
-                    app.final_kept_paths.add(p_str)
-        
-        if not app.skip_apply:
-            folder_kept_paths.update(app.final_kept_paths)
-
-    # 個別ファイルの移動処理
-    if args.move and not getattr(app, 'skip_apply', False):
-        move_kept_files(folder_kept_paths, args, c, conn)
-    
     return False
 
 
@@ -1173,7 +1402,6 @@ def move_kept_files(folder_kept_paths, args, c, conn):
             shutil.move(str(src_p), str(target_p))
             new_p_str = str(target_p.resolve())
             c.execute("UPDATE images SET path = ? WHERE path = ?", (new_p_str, p_str))
-            print(f"  ✅ 移動成功: {src_p.name} -> {target_p}")
         except Exception as e:
             print(f"  ❌ 移動失敗: {src_p.name} -> {e}")
 
@@ -1358,40 +1586,6 @@ def main():
             if is_quit: break
 
         cleanup_empty_folders(current_target, delete_root=args.each)
-
-    # --- 全処理終了後のフォルダ移動 (Similar単体で -E なしの場合の互換用) ---
-    if not args.each and args.mode.startswith("s") and not args.then_picker and args.move:
-        import image_tools.settings as app_settings
-        s = app_settings.load_settings()
-        dest = s.get("PICKER_MOVE_DEST")
-        
-        # 移動制限用のパスを特定
-        base_save = s.get("BASE_SAVE_DIR")
-        restrict_path = Path(base_save).resolve() / "SNS画像" if base_save else None
-
-        if dest:
-            dest_path = Path(dest)
-            for d in target_dirs_paths:
-                d_resolved = d.resolve()
-                if not d_resolved.exists() or not d_resolved.is_dir(): continue
-                
-                # 特定のディレクトリ配下のみ移動対象とする
-                if restrict_path:
-                    try:
-                        d_resolved.relative_to(restrict_path)
-                    except ValueError:
-                        continue # 移動対象外（フォルダごと維持）
-
-                target_dest = dest_path / d.name
-                if target_dest.exists(): continue
-                try:
-                    shutil.move(str(d), str(target_dest))
-                    old_p = str(d.resolve()); new_p = str(target_dest.resolve()); pat = old_p + os.sep + "%"
-                    c.execute("UPDATE images SET path = ? || SUBSTR(path, LENGTH(?) + 1) WHERE path LIKE ?", (new_p, old_p, pat))
-                    c.execute("UPDATE similarity_edges SET path1 = ? || SUBSTR(path1, LENGTH(?) + 1) WHERE path1 LIKE ?", (new_p, old_p, pat))
-                    c.execute("UPDATE similarity_edges SET path2 = ? || SUBSTR(path2, LENGTH(?) + 1) WHERE path2 LIKE ?", (new_p, old_p, pat))
-                except: pass
-            conn.commit()
 
     conn.close()
 
